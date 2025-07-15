@@ -1,5 +1,5 @@
 """
-Real-time Neocore EEG plotter with pwelch frequency analysis.
+Real-time Neocore EEG plotter with proper ADS1299 data conversion.
 
 pip install bleak matplotlib scipy numpy
 python neo_plot.py                 # scan for any QCC5181 / NEOCORE
@@ -41,9 +41,109 @@ NEOCORE_CMD_ID_EEG_TEST_SIGNAL_CTRL = 1
 # Notification IDs
 NEOCORE_NOTIFY_ID_EEG_DATA = 0
 
+# ─────────────────────────── ADS1299 Configuration ──────────────────────────
+# ADS1299 specifications for voltage conversion
+ADS1299_VREF = 4.5  # Reference voltage in volts (typical)
+ADS1299_GAIN = 24   # Programmable gain (1, 2, 4, 6, 8, 12, 24)
+ADS1299_RESOLUTION = 24  # 24-bit ADC
+
+# Calculate LSB value in microvolts
+# Formula from datasheet: 1 LSB = (2 × VREF / Gain) / 2^24
+LSB_UV = (2 * ADS1299_VREF * 1000000) / (ADS1299_GAIN * (2**ADS1299_RESOLUTION))
+print(f"ADS1299 LSB = {LSB_UV:.3f} µV")
+
+def convert_ads1299_to_uv(raw_value):
+    """Convert ADS1299 raw value to microvolts"""
+    # Handle 24-bit signed integer conversion
+    if raw_value > 0x7FFFFF:  # If greater than max positive 24-bit
+        raw_value = raw_value - (1 << 24)  # Convert to negative
+
+    return raw_value * LSB_UV
+
+def parse_ads1299_data(data, debug=False):
+    """Parse ADS1299 data structure"""
+    if debug:
+        print(f"Raw data length: {len(data)} bytes")
+        print(f"First 24 bytes: {data[:24].hex()}")
+
+    # Try different parsing methods
+    results = {}
+
+    # Method 1: 32-bit integers (current method)
+    if len(data) % 4 == 0:
+        num_samples_32 = len(data) // 4
+        try:
+            samples_32 = struct.unpack(f"<{num_samples_32}i", data)
+            ch1_32 = [convert_ads1299_to_uv(samples_32[i]) for i in range(0, len(samples_32), 2)]
+            ch2_32 = [convert_ads1299_to_uv(samples_32[i]) for i in range(1, len(samples_32), 2)]
+            results['32bit_alternating'] = (ch1_32, ch2_32)
+            if debug:
+                print(f"32-bit alternating: {len(ch1_32)} + {len(ch2_32)} samples")
+                print(f"Ch1 range: {min(ch1_32):.1f} to {max(ch1_32):.1f} µV")
+                print(f"Ch2 range: {min(ch2_32):.1f} to {max(ch2_32):.1f} µV")
+        except:
+            pass
+
+    # Method 2: 24-bit samples (3 bytes each)
+    if len(data) % 3 == 0:
+        num_samples_24 = len(data) // 3
+        try:
+            samples_24 = []
+            for i in range(0, len(data), 3):
+                # Convert 3 bytes to 24-bit signed integer
+                raw_bytes = data[i:i+3]
+                # Little endian 24-bit
+                value = int.from_bytes(raw_bytes, byteorder='little', signed=False)
+                if value > 0x7FFFFF:
+                    value = value - (1 << 24)
+                samples_24.append(convert_ads1299_to_uv(value))
+
+            # Try alternating pattern
+            ch1_24 = [samples_24[i] for i in range(0, len(samples_24), 2)]
+            ch2_24 = [samples_24[i] for i in range(1, len(samples_24), 2)]
+            results['24bit_alternating'] = (ch1_24, ch2_24)
+            if debug:
+                print(f"24-bit alternating: {len(ch1_24)} + {len(ch2_24)} samples")
+                print(f"Ch1 range: {min(ch1_24):.1f} to {max(ch1_24):.1f} µV")
+                print(f"Ch2 range: {min(ch2_24):.1f} to {max(ch2_24):.1f} µV")
+        except:
+            pass
+
+    # Method 3: Check if data is sequential (all ch1 then all ch2)
+    if len(data) % 4 == 0:
+        num_samples_32 = len(data) // 4
+        try:
+            samples_32 = struct.unpack(f"<{num_samples_32}i", data)
+            mid_point = len(samples_32) // 2
+            ch1_seq = [convert_ads1299_to_uv(samples_32[i]) for i in range(mid_point)]
+            ch2_seq = [convert_ads1299_to_uv(samples_32[i]) for i in range(mid_point, len(samples_32))]
+            results['32bit_sequential'] = (ch1_seq, ch2_seq)
+            if debug:
+                print(f"32-bit sequential: {len(ch1_seq)} + {len(ch2_seq)} samples")
+                print(f"Ch1 range: {min(ch1_seq):.1f} to {max(ch1_seq):.1f} µV")
+                print(f"Ch2 range: {min(ch2_seq):.1f} to {max(ch2_seq):.1f} µV")
+        except:
+            pass
+
+    # Method 4: Try big endian
+    if len(data) % 4 == 0:
+        num_samples_32 = len(data) // 4
+        try:
+            samples_32_be = struct.unpack(f">{num_samples_32}i", data)
+            ch1_be = [convert_ads1299_to_uv(samples_32_be[i]) for i in range(0, len(samples_32_be), 2)]
+            ch2_be = [convert_ads1299_to_uv(samples_32_be[i]) for i in range(1, len(samples_32_be), 2)]
+            results['32bit_bigendian'] = (ch1_be, ch2_be)
+            if debug:
+                print(f"32-bit big endian: {len(ch1_be)} + {len(ch2_be)} samples")
+                print(f"Ch1 range: {min(ch1_be):.1f} to {max(ch1_be):.1f} µV")
+                print(f"Ch2 range: {min(ch2_be):.1f} to {max(ch2_be):.1f} µV")
+        except:
+            pass
+
+    return results
+
 # ─────────────────────────── Signal Processing ──────────────────────────
-# Sampling rate - adjust based on your device
-SAMPLE_RATE = 250  # Hz - adjust this to match your device's actual rate
+SAMPLE_RATE = 250  # Hz
 WINDOW_DURATION = 1  # seconds
 WINDOW_SIZE = int(WINDOW_DURATION * SAMPLE_RATE)
 
@@ -58,21 +158,19 @@ def filter_eeg(data, sps, enable_filtering=True):
         # Bandpass filter: 0.5 Hz to 80 Hz
         nyquist = sps / 2
         low_cutoff = 0.5 / nyquist
-        high_cutoff = min(80.0, nyquist - 1) / nyquist  # Ensure below Nyquist
+        high_cutoff = min(80.0, nyquist - 1) / nyquist
 
         if high_cutoff > low_cutoff:
-            # Bandpass filter
             b_bp, a_bp = signal.butter(N=4, Wn=[low_cutoff, high_cutoff], btype='band', analog=False)
             filtered_data = signal.filtfilt(b_bp, a_bp, data_array)
         else:
-            # If we can't do bandpass (sampling rate too low), just do high-pass
             b_hp, a_hp = signal.butter(N=4, Wn=low_cutoff, btype='high', analog=False)
             filtered_data = signal.filtfilt(b_hp, a_hp, data_array)
 
-        # 60 Hz notch filter (strong notch with Q=30)
-        if sps > 120:  # Only apply if sampling rate allows
+        # 60 Hz notch filter
+        if sps > 120:
             notch_freq = 60.0
-            Q = 30.0  # Quality factor for strong notch
+            Q = 30.0
             b_notch, a_notch = signal.iirnotch(notch_freq, Q, sps)
             filtered_data = signal.filtfilt(b_notch, a_notch, filtered_data)
 
@@ -80,9 +178,9 @@ def filter_eeg(data, sps, enable_filtering=True):
 
     except Exception as e:
         print(f"Error in filtering: {e}")
-        return data  # Return original data if filtering fails
+        return data
 
-# Initialize lists to store historical values
+# Band power calculation functions (same as before)
 history_theta = []
 history_alpha = []
 history_beta = []
@@ -96,21 +194,18 @@ def pwelch_analysis(data, sps):
         return None, None, None, None, None, None
 
     try:
-        # Calculate power spectral density
         f_, pxx = signal.welch(data, fs=sps,
                               window=signal.windows.tukey(len(data), sym=False, alpha=.17),
                               nperseg=min(len(data), WINDOW_SIZE),
                               noverlap=int(min(len(data), WINDOW_SIZE) * 0.75),
-                              nfft=min(len(data), WINDOW_SIZE * 2),  # Increased FFT size for better resolution
+                              nfft=min(len(data), WINDOW_SIZE * 2),
                               return_onesided=True,
                               scaling='spectrum', axis=-1, average='mean')
 
         power = pxx * 0.84
 
-        # Calculate frequency band powers
         freq_res = f_[1] - f_[0]
 
-        # Define frequency bands (more precise with better resolution)
         theta_start = int(4 / freq_res)
         theta_end = int(8 / freq_res)
         alpha_start = int(8 / freq_res)
@@ -120,7 +215,6 @@ def pwelch_analysis(data, sps):
         gamma_start = int(30 / freq_res)
         gamma_end = int(100 / freq_res)
 
-        # Ensure indices are within bounds
         theta_end = min(theta_end, len(power))
         alpha_end = min(alpha_end, len(power))
         beta_end = min(beta_end, len(power))
@@ -131,12 +225,10 @@ def pwelch_analysis(data, sps):
         beta = np.sum(power[beta_start:beta_end]) if beta_end > beta_start else 0
         gamma = np.sum(power[gamma_start:gamma_end]) if gamma_end > gamma_start else 0
 
-        # Update history
         history_theta.append(theta)
         history_alpha.append(alpha)
         history_beta.append(beta)
 
-        # Maintain history size
         if len(history_theta) > moving_average_samples:
             history_theta.pop(0)
         if len(history_alpha) > moving_average_samples:
@@ -144,7 +236,6 @@ def pwelch_analysis(data, sps):
         if len(history_beta) > moving_average_samples:
             history_beta.pop(0)
 
-        # Calculate attention index (theta/beta ratio)
         attention_index = 0
         if len(history_theta) >= 5 and len(history_beta) >= 5:
             avg_theta = np.mean(history_theta)
@@ -161,10 +252,12 @@ def pwelch_analysis(data, sps):
 # ─────────────────────────── plotting helper ─────────────────────────
 class LivePlot:
     TIME_WIDTH = 1000
-    FREQ_WIDTH = 100  # Number of frequency analysis windows to keep
+    FREQ_WIDTH = 100
 
     def __init__(self, enable_filtering=False):
         self.enable_filtering = enable_filtering
+        self.parsing_method = '32bit_alternating'  # Default, will be auto-detected
+        self.packet_count = 0
 
         # Time domain data
         self.ch1 = deque(maxlen=self.TIME_WIDTH)
@@ -172,12 +265,11 @@ class LivePlot:
         self.filtered_ch1 = deque(maxlen=self.TIME_WIDTH)
         self.filtered_ch2 = deque(maxlen=self.TIME_WIDTH)
 
-        # Frequency domain data
+        # Frequency and band power data (same as before)
         self.freq_data = None
         self.power_ch1_history = deque(maxlen=self.FREQ_WIDTH)
         self.power_ch2_history = deque(maxlen=self.FREQ_WIDTH)
 
-        # Band powers
         self.theta_ch1 = deque(maxlen=self.FREQ_WIDTH)
         self.alpha_ch1 = deque(maxlen=self.FREQ_WIDTH)
         self.beta_ch1 = deque(maxlen=self.FREQ_WIDTH)
@@ -192,84 +284,74 @@ class LivePlot:
 
         self.data_updated = False
 
-        # Create the plot with subplots
+        # Create plots (same layout as before)
         plt.ion()
         self.fig = plt.figure(figsize=(16, 12))
 
-        # Determine layout based on filtering option
         if self.enable_filtering:
-            # Time domain plots (raw and filtered)
             self.ax_time1 = plt.subplot(3, 2, 1)
             self.ax_time2 = plt.subplot(3, 2, 2)
             self.ax_filt1 = plt.subplot(3, 2, 3)
             self.ax_filt2 = plt.subplot(3, 2, 4)
-
-            # Frequency domain plots
             self.ax_freq1 = plt.subplot(3, 2, 5)
             self.ax_freq2 = plt.subplot(3, 2, 6)
 
-            # Initialize plot lines
             self.l_time1, = self.ax_time1.plot([], [], 'g-', linewidth=1, label='Ch1 Raw')
             self.l_time2, = self.ax_time2.plot([], [], 'r-', linewidth=1, label='Ch2 Raw')
             self.l_filt1, = self.ax_filt1.plot([], [], 'b-', linewidth=1, label='Ch1 Filtered')
             self.l_filt2, = self.ax_filt2.plot([], [], 'm-', linewidth=1, label='Ch2 Filtered')
 
-            # Configure axes
-            self.ax_time1.set_title('Channel 1 - Raw EEG')
-            self.ax_time2.set_title('Channel 2 - Raw EEG')
-            self.ax_filt1.set_title('Channel 1 - Filtered EEG (0.5-80Hz + 60Hz notch)')
-            self.ax_filt2.set_title('Channel 2 - Filtered EEG (0.5-80Hz + 60Hz notch)')
+            self.ax_time1.set_title('Channel 1 - Raw EEG (µV)')
+            self.ax_time2.set_title('Channel 2 - Raw EEG (µV)')
+            self.ax_filt1.set_title('Channel 1 - Filtered EEG (µV)')
+            self.ax_filt2.set_title('Channel 2 - Filtered EEG (µV)')
 
             for ax in [self.ax_time1, self.ax_time2, self.ax_filt1, self.ax_filt2]:
                 ax.set_xlim(0, self.TIME_WIDTH)
-                ax.set_ylim(-1000000, 1000000)
+                ax.set_ylim(-200, 200)  # Typical EEG range in µV
                 ax.grid(True, alpha=0.3)
                 ax.legend()
-
+                ax.set_ylabel('Amplitude (µV)')
         else:
-            # Only time domain and frequency domain (no filtered plots)
             self.ax_time1 = plt.subplot(2, 2, 1)
             self.ax_time2 = plt.subplot(2, 2, 2)
             self.ax_freq1 = plt.subplot(2, 2, 3)
             self.ax_freq2 = plt.subplot(2, 2, 4)
 
-            # Initialize plot lines
             self.l_time1, = self.ax_time1.plot([], [], 'g-', linewidth=1, label='Ch1 Raw')
             self.l_time2, = self.ax_time2.plot([], [], 'r-', linewidth=1, label='Ch2 Raw')
 
-            # Configure axes
-            self.ax_time1.set_title('Channel 1 - Raw EEG')
-            self.ax_time2.set_title('Channel 2 - Raw EEG')
+            self.ax_time1.set_title('Channel 1 - Raw EEG (µV)')
+            self.ax_time2.set_title('Channel 2 - Raw EEG (µV)')
 
             for ax in [self.ax_time1, self.ax_time2]:
                 ax.set_xlim(0, self.TIME_WIDTH)
-                ax.set_ylim(-1000000, 1000000)
+                ax.set_ylim(-200, 200)  # Typical EEG range in µV
                 ax.grid(True, alpha=0.3)
                 ax.legend()
+                ax.set_ylabel('Amplitude (µV)')
 
-        # Frequency domain plots (common configuration)
+        # Frequency domain setup (same as before)
         self.l_freq1, = self.ax_freq1.plot([], [], 'g-', linewidth=1, label='Ch1 PSD')
         self.l_freq2, = self.ax_freq2.plot([], [], 'r-', linewidth=1, label='Ch2 PSD')
 
-        self.ax_freq1.set_title('Channel 1 - Power Spectral Density (0-100 Hz)')
-        self.ax_freq2.set_title('Channel 2 - Power Spectral Density (0-100 Hz)')
+        self.ax_freq1.set_title('Channel 1 - Power Spectral Density')
+        self.ax_freq2.set_title('Channel 2 - Power Spectral Density')
 
         for ax in [self.ax_freq1, self.ax_freq2]:
-            ax.set_xlim(0, 100)  # Extended to 100 Hz
+            ax.set_xlim(0, 100)
             ax.set_ylim(0, 1000)
             ax.set_xlabel('Frequency (Hz)')
-            ax.set_ylabel('Power')
+            ax.set_ylabel('Power (µV²/Hz)')
             ax.grid(True, alpha=0.3)
             ax.legend()
 
-            # Add frequency band markers
-            ax.axvline(x=4, color='purple', linestyle='--', alpha=0.5, label='θ')
-            ax.axvline(x=8, color='blue', linestyle='--', alpha=0.5, label='α')
-            ax.axvline(x=13, color='green', linestyle='--', alpha=0.5, label='β')
-            ax.axvline(x=30, color='red', linestyle='--', alpha=0.5, label='γ')
-            ax.axvline(x=60, color='orange', linestyle=':', alpha=0.7, label='60Hz')
+            ax.axvline(x=4, color='purple', linestyle='--', alpha=0.5)
+            ax.axvline(x=8, color='blue', linestyle='--', alpha=0.5)
+            ax.axvline(x=13, color='green', linestyle='--', alpha=0.5)
+            ax.axvline(x=30, color='red', linestyle='--', alpha=0.5)
+            ax.axvline(x=60, color='orange', linestyle=':', alpha=0.7)
 
-        # Add text for band powers
         self.text1 = self.ax_freq1.text(0.02, 0.98, '', transform=self.ax_freq1.transAxes,
                                         verticalalignment='top', fontsize=8,
                                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
@@ -280,29 +362,25 @@ class LivePlot:
         plt.tight_layout()
         plt.show(block=False)
 
-    def push(self, a: List[int], b: List[int]):
-        """Add new data to the plot buffers"""
+    def push(self, a: List[float], b: List[float]):
+        """Add new data to the plot buffers (now in µV)"""
         self.ch1.extend(a)
         self.ch2.extend(b)
 
-        # Apply filtering if enabled and we have enough data
+        # Apply filtering if enabled
         if self.enable_filtering and len(self.ch1) >= WINDOW_SIZE:
-            # Get recent data for filtering
             recent_ch1 = list(self.ch1)[-WINDOW_SIZE:]
             recent_ch2 = list(self.ch2)[-WINDOW_SIZE:]
 
-            # Filter the data
             filtered_ch1 = filter_eeg(recent_ch1, SAMPLE_RATE, self.enable_filtering)
             filtered_ch2 = filter_eeg(recent_ch2, SAMPLE_RATE, self.enable_filtering)
 
-            # Add filtered data (only the new samples)
             new_samples = len(a)
             if len(filtered_ch1) >= new_samples:
                 self.filtered_ch1.extend(filtered_ch1[-new_samples:])
             if len(filtered_ch2) >= new_samples:
                 self.filtered_ch2.extend(filtered_ch2[-new_samples:])
 
-            # Perform frequency analysis on filtered data
             if len(filtered_ch1) >= WINDOW_SIZE:
                 f, pxx1, theta1, alpha1, beta1, gamma1, att1 = pwelch_analysis(filtered_ch1, SAMPLE_RATE)
                 if f is not None:
@@ -325,7 +403,6 @@ class LivePlot:
                     self.attention_ch2.append(att2)
 
         elif len(self.ch1) >= WINDOW_SIZE:
-            # Perform frequency analysis on raw data if filtering is disabled
             recent_ch1 = list(self.ch1)[-WINDOW_SIZE:]
             recent_ch2 = list(self.ch2)[-WINDOW_SIZE:]
 
@@ -351,7 +428,7 @@ class LivePlot:
         self.data_updated = True
 
     def update_plot(self):
-        """Update all plots"""
+        """Update all plots with proper µV scaling"""
         if not self.data_updated:
             return
 
@@ -362,45 +439,40 @@ class LivePlot:
                 self.l_time1.set_data(x_data, list(self.ch1))
                 self.l_time2.set_data(x_data, list(self.ch2))
 
-                # Auto-scale time domain
+                # Auto-scale for typical EEG range
                 y1_data = list(self.ch1)
-                y2_data = list(self.ch2)
                 if y1_data:
                     y1_min, y1_max = min(y1_data), max(y1_data)
                     if y1_max > y1_min:
-                        margin = (y1_max - y1_min) * 0.1
+                        margin = max(50, (y1_max - y1_min) * 0.1)  # At least 50µV margin
                         self.ax_time1.set_ylim(y1_min - margin, y1_max + margin)
                         self.ax_time2.set_ylim(y1_min - margin, y1_max + margin)
 
-                # Update x-axis
                 self.ax_time1.set_xlim(max(0, len(x_data) - self.TIME_WIDTH), len(x_data))
                 self.ax_time2.set_xlim(max(0, len(x_data) - self.TIME_WIDTH), len(x_data))
 
-            # Update filtered data plots (only if filtering is enabled)
+            # Update filtered plots if enabled
             if self.enable_filtering and len(self.filtered_ch1) > 0:
                 x_filt = list(range(len(self.filtered_ch1)))
                 self.l_filt1.set_data(x_filt, list(self.filtered_ch1))
                 self.l_filt2.set_data(x_filt, list(self.filtered_ch2))
 
-                # Auto-scale filtered plots
                 y1_filt = list(self.filtered_ch1)
                 if y1_filt:
                     y1_min, y1_max = min(y1_filt), max(y1_filt)
                     if y1_max > y1_min:
-                        margin = (y1_max - y1_min) * 0.1
+                        margin = max(50, (y1_max - y1_min) * 0.1)
                         self.ax_filt1.set_ylim(y1_min - margin, y1_max + margin)
                         self.ax_filt2.set_ylim(y1_min - margin, y1_max + margin)
 
                 self.ax_filt1.set_xlim(max(0, len(x_filt) - self.TIME_WIDTH), len(x_filt))
                 self.ax_filt2.set_xlim(max(0, len(x_filt) - self.TIME_WIDTH), len(x_filt))
 
-            # Update frequency domain plots
+            # Update frequency plots
             if self.freq_data is not None and len(self.power_ch1_history) > 0:
-                # Use the most recent power spectrum
                 latest_pxx1 = self.power_ch1_history[-1]
                 latest_pxx2 = self.power_ch2_history[-1]
 
-                # Limit to 0-100 Hz range
                 freq_mask = self.freq_data <= 100
                 f_plot = self.freq_data[freq_mask]
                 pxx1_plot = latest_pxx1[freq_mask]
@@ -409,20 +481,17 @@ class LivePlot:
                 self.l_freq1.set_data(f_plot, pxx1_plot)
                 self.l_freq2.set_data(f_plot, pxx2_plot)
 
-                # Auto-scale frequency plots
                 if len(pxx1_plot) > 0:
                     max_power = max(np.max(pxx1_plot), np.max(pxx2_plot))
                     self.ax_freq1.set_ylim(0, max_power * 1.1)
                     self.ax_freq2.set_ylim(0, max_power * 1.1)
 
-                # Update band power text
                 if len(self.theta_ch1) > 0:
-                    text1 = f"θ: {self.theta_ch1[-1]:.2f}\nα: {self.alpha_ch1[-1]:.2f}\nβ: {self.beta_ch1[-1]:.2f}\nγ: {self.gamma_ch1[-1]:.2f}\nAtt: {self.attention_ch1[-1]:.3f}"
-                    text2 = f"θ: {self.theta_ch2[-1]:.2f}\nα: {self.alpha_ch2[-1]:.2f}\nβ: {self.beta_ch2[-1]:.2f}\nγ: {self.gamma_ch2[-1]:.2f}\nAtt: {self.attention_ch2[-1]:.3f}"
+                    text1 = f"Method: {self.parsing_method}\nθ: {self.theta_ch1[-1]:.2f}\nα: {self.alpha_ch1[-1]:.2f}\nβ: {self.beta_ch1[-1]:.2f}\nγ: {self.gamma_ch1[-1]:.2f}\nAtt: {self.attention_ch1[-1]:.3f}"
+                    text2 = f"Packets: {self.packet_count}\nθ: {self.theta_ch2[-1]:.2f}\nα: {self.alpha_ch2[-1]:.2f}\nβ: {self.beta_ch2[-1]:.2f}\nγ: {self.gamma_ch2[-1]:.2f}\nAtt: {self.attention_ch2[-1]:.3f}"
                     self.text1.set_text(text1)
                     self.text2.set_text(text2)
 
-            # Redraw
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
             self.data_updated = False
@@ -437,6 +506,8 @@ class Headset:
         self.use_test = use_test
         self.enable_filtering = enable_filtering
         self.plot = LivePlot(enable_filtering)
+        self.packet_count = 0
+        self.parsing_method_locked = False
 
     async def _scan(self) -> str:
         if self.mac:
@@ -468,24 +539,59 @@ class Headset:
         return type_val, length, msg_index, value
 
     def _data_handler_ecg(self, data: bytearray, length: int):
-        if len(data) % 4 != 0:
+        """Handle EEG data with proper ADS1299 parsing and voltage conversion"""
+        self.packet_count += 1
+
+        # Try multiple parsing methods on first few packets
+        debug_mode = self.packet_count <= 3 and not self.parsing_method_locked
+
+        parse_results = parse_ads1299_data(data, debug=debug_mode)
+
+        if not parse_results:
+            print("No valid parsing methods found")
             return
 
-        num_samples = len(data) // 4
-        try:
-            ecg_data = struct.unpack(f"<{num_samples}i", data)
+        # Auto-select best parsing method based on reasonable EEG values
+        best_method = None
+        best_score = float('inf')
 
-            ch1_data = []
-            ch2_data = []
-            for i in range(0, num_samples, 2):
-                ch1_data.append(ecg_data[i])
-                if i + 1 < num_samples:
-                    ch2_data.append(ecg_data[i + 1])
+        for method_name, (ch1_data, ch2_data) in parse_results.items():
+            if len(ch1_data) > 0 and len(ch2_data) > 0:
+                # Score based on reasonable EEG amplitude (typically < 500µV)
+                ch1_max = max(abs(x) for x in ch1_data)
+                ch2_max = max(abs(x) for x in ch2_data)
+                max_amp = max(ch1_max, ch2_max)
 
+                # Prefer amplitudes in the 10-500µV range
+                if 10 <= max_amp <= 500:
+                    score = 0  # Perfect score
+                elif max_amp < 10:
+                    score = 10 - max_amp  # Too small
+                else:
+                    score = max_amp - 500  # Too large
+
+                if debug_mode:
+                    print(f"{method_name}: max_amp={max_amp:.1f}µV, score={score:.1f}")
+
+                if score < best_score:
+                    best_score = score
+                    best_method = method_name
+
+        if best_method and not self.parsing_method_locked:
+            self.plot.parsing_method = best_method
+            if self.packet_count >= 3:
+                self.parsing_method_locked = True
+                print(f"Auto-selected parsing method: {best_method}")
+
+        # Use the selected parsing method
+        if best_method and best_method in parse_results:
+            ch1_data, ch2_data = parse_results[best_method]
+            self.plot.packet_count = self.packet_count
             self.plot.push(ch1_data, ch2_data)
-
-        except struct.error as e:
-            print(f"Error unpacking EEG data: {e}")
+        elif self.plot.parsing_method in parse_results:
+            ch1_data, ch2_data = parse_results[self.plot.parsing_method]
+            self.plot.packet_count = self.packet_count
+            self.plot.push(ch1_data, ch2_data)
 
     def _on_notify(self, _h, data: bytearray):
         if len(data) < 2:
@@ -531,18 +637,18 @@ class Headset:
             await self._send(cli, NEOCORE_SENSOR_CFG_FEATURE_ID, NEOCORE_CMD_ID_DATA_STREAM_CTRL, b"\x01")
             await asyncio.sleep(0.1)
 
-            print("All plots active. Close window to stop streaming.")
+            print("EEG Plotter with ADS1299 calibration active!")
             print("Configuration:")
+            print(f"- ADS1299 VREF: {ADS1299_VREF}V, Gain: {ADS1299_GAIN}x")
+            print(f"- LSB value: {LSB_UV:.3f} µV")
             print(f"- Sample rate: {SAMPLE_RATE} Hz")
-            print(f"- Filtering: {'ENABLED (0.5-80Hz + 60Hz notch)' if self.enable_filtering else 'DISABLED'}")
-            print("- PSD range: 0-100 Hz")
-            print("- Brain waves: θ(4-8Hz), α(8-13Hz), β(13-30Hz), γ(30-100Hz)")
-            print("- Attention index: θ/β ratio")
+            print(f"- Filtering: {'ENABLED' if self.enable_filtering else 'DISABLED'}")
+            print("- Auto-detecting optimal data parsing method...")
 
             plot_update_counter = 0
             while plt.fignum_exists(self.plot.fig.number):
                 plot_update_counter += 1
-                if plot_update_counter >= 3:  # Update every ~30ms
+                if plot_update_counter >= 3:
                     self.plot.update_plot()
                     plot_update_counter = 0
 
@@ -563,21 +669,10 @@ def main():
     enable_filtering = "--filter" in sys.argv
     mac = next((a for a in sys.argv[1:] if not a.startswith("--")), None)
 
-    print("Neocore EEG Plotter with Real-time Frequency Analysis")
-    print(f"Sample rate: {SAMPLE_RATE} Hz")
-    print(f"Window size: {WINDOW_SIZE} samples ({WINDOW_DURATION}s)")
+    print("Neocore EEG Plotter with ADS1299 Voltage Conversion")
+    print(f"ADS1299 Configuration: VREF={ADS1299_VREF}V, Gain={ADS1299_GAIN}x, LSB={LSB_UV:.3f}µV")
     print(f"Test mode: {'ON' if test else 'OFF'}")
-    print(f"Filtering: {'ENABLED (0.5-80Hz bandpass + 60Hz notch)' if enable_filtering else 'DISABLED'}")
-    print(f"PSD range: 0-100 Hz")
-    if mac:
-        print(f"Target MAC: {mac}")
-    else:
-        print("Will scan for devices")
-
-    print("\nUsage:")
-    print("  python neo_plot.py --test --filter  # Test mode with filtering")
-    print("  python neo_plot.py --filter         # Normal mode with filtering")
-    print("  python neo_plot.py                  # Normal mode without filtering")
+    print(f"Filtering: {'ENABLED' if enable_filtering else 'DISABLED'}")
 
     try:
         asyncio.run(Headset(mac, test, enable_filtering).run())
