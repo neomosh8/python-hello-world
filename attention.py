@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Neocore EEG Attention Assessment - Visual Oddball Paradigm
-Measures sustained attention and selective attention using P300 ERP and frequency analysis
+Neocore EEG Attention Assessment - Enhanced Visual Oddball Paradigm
+Complete implementation with artifact rejection and improved analysis
 """
 
 import asyncio
@@ -13,12 +13,12 @@ from collections import deque
 from typing import List, Tuple, Optional
 
 import numpy as np
-from scipy import signal
+from scipy import signal, stats
 import matplotlib.pyplot as plt
 from bleak import BleakScanner, BleakClient
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BLE Configuration (from original code)
+# BLE Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
 RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -36,11 +36,11 @@ PDU_TYPE_COMMAND = 0x00
 SAMPLE_RATE = 250
 SAMPLES_PER_CHUNK = 27
 NUM_CHANNELS = 2
-NUM_TRIALS = 100  # Total number of stimuli
+NUM_TRIALS = 20  # Total number of stimuli
 TARGET_PROBABILITY = 0.2  # 20% targets, 80% standards
 STIMULUS_DURATION = 1.5  # seconds per stimulus
 ISI_RANGE = (0.8, 1.2)  # Inter-stimulus interval range (seconds)
-REST_TIME_SEC = 60  # 1 minute rest periods
+REST_TIME_SEC = 10  # 1 minute rest periods
 
 # Frequency bands for attention analysis
 THETA_BAND = (4, 8)  # Attention and working memory
@@ -49,7 +49,173 @@ BETA_BAND = (13, 30)  # Focused attention
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BLE Protocol Functions (from original code)
+# Enhanced Signal Processing with Artifact Rejection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ImprovedEEGProcessor:
+    """Enhanced EEG processing with artifact rejection and validation."""
+
+    def __init__(self, sample_rate=250):
+        self.fs = sample_rate
+        self.setup_filters()
+
+    def setup_filters(self):
+        """Setup filtering parameters."""
+        nyq = self.fs / 2
+
+        # More aggressive artifact removal
+        # Bandpass: 0.5-45 Hz (removes DC drift and high-freq noise)
+        self.bp_sos = signal.butter(6, [0.5 / nyq, 45 / nyq], btype='band', output='sos')
+
+        # Notch filters for line noise - FIXED: convert to SOS format
+        notch_60_b, notch_60_a = signal.iirnotch(60, 30, self.fs)
+        self.notch_60_sos = signal.tf2sos(notch_60_b, notch_60_a)
+
+        notch_50_b, notch_50_a = signal.iirnotch(50, 25, self.fs)
+        self.notch_50_sos = signal.tf2sos(notch_50_b, notch_50_a)
+
+    def preprocess_signal(self, data: np.ndarray) -> np.ndarray:
+        """Apply comprehensive preprocessing."""
+        if len(data) < self.fs:  # Need at least 1 second of data
+            return data
+
+        try:
+            # Remove extreme outliers (likely artifacts)
+            data = self.remove_extreme_outliers(data)
+
+            # Apply bandpass filter
+            filtered = signal.sosfilt(self.bp_sos, data)
+
+            # Apply notch filters
+            filtered = signal.sosfilt(self.notch_60_sos, filtered)
+            filtered = signal.sosfilt(self.notch_50_sos, filtered)
+
+            # Remove remaining artifacts
+            filtered = self.artifact_rejection(filtered)
+
+            return filtered
+
+        except Exception as e:
+            print(f"Error in preprocessing: {e}")
+            # Return basic filtered data if advanced processing fails
+            try:
+                return signal.sosfilt(self.bp_sos, data)
+            except:
+                return data
+
+    def remove_extreme_outliers(self, data: np.ndarray, threshold_std=5) -> np.ndarray:
+        """Remove extreme outliers that are likely artifacts."""
+        mean_val = np.mean(data)
+        std_val = np.std(data)
+
+        # Clip values beyond threshold_std standard deviations
+        lower_bound = mean_val - threshold_std * std_val
+        upper_bound = mean_val + threshold_std * std_val
+
+        return np.clip(data, lower_bound, upper_bound)
+
+    def artifact_rejection(self, data: np.ndarray, window_size=1.0) -> np.ndarray:
+        """Reject segments with high amplitude or gradient (artifacts)."""
+        if len(data) < self.fs:
+            return data
+
+        window_samples = int(window_size * self.fs)
+        cleaned_data = data.copy()
+
+        # Sliding window artifact detection
+        for i in range(0, len(data) - window_samples, window_samples // 2):
+            segment = data[i:i + window_samples]
+
+            # Check for high amplitude artifacts
+            if np.max(np.abs(segment)) > 200:  # Adjust threshold as needed
+                # Replace with interpolated values
+                if i > 0 and i + window_samples < len(data):
+                    start_val = data[i - 1]
+                    end_val = data[i + window_samples]
+                    cleaned_data[i:i + window_samples] = np.linspace(start_val, end_val, window_samples)
+
+            # Check for high gradient (muscle artifacts)
+            gradient = np.abs(np.diff(segment))
+            if np.mean(gradient) > 50:  # Adjust threshold as needed
+                if i > 0 and i + window_samples < len(data):
+                    start_val = data[i - 1]
+                    end_val = data[i + window_samples]
+                    cleaned_data[i:i + window_samples] = np.linspace(start_val, end_val, window_samples)
+
+        return cleaned_data
+
+    def calculate_band_power_robust(self, data: np.ndarray, freq_band: Tuple[float, float]) -> float:
+        """Calculate band power with robust spectral estimation."""
+        if len(data) < 2 * self.fs:  # Need at least 2 seconds
+            return 0.0
+
+        try:
+            # Use Welch's method with more conservative parameters
+            nperseg = min(self.fs * 2, len(data) // 4)  # 2-second windows or 1/4 of data
+            noverlap = nperseg // 2
+
+            freqs, psd = signal.welch(
+                data,
+                self.fs,
+                nperseg=nperseg,
+                noverlap=noverlap,
+                window='hann',
+                detrend='constant'
+            )
+
+            # Find frequency band
+            band_mask = (freqs >= freq_band[0]) & (freqs <= freq_band[1])
+
+            if not np.any(band_mask):
+                return 0.0
+
+            # Calculate power (integrate PSD)
+            freq_res = freqs[1] - freqs[0]
+            band_power = np.sum(psd[band_mask]) * freq_res
+
+            return band_power
+
+        except Exception as e:
+            print(f"Error calculating band power: {e}")
+            return 0.0
+
+    def validate_data_quality(self, data: np.ndarray) -> dict:
+        """Assess data quality metrics."""
+        if len(data) == 0:
+            return {"quality": "poor", "reasons": ["No data"]}
+
+        reasons = []
+
+        # Check signal amplitude
+        amplitude = np.max(data) - np.min(data)
+        if amplitude < 10:
+            reasons.append("Very low amplitude")
+        elif amplitude > 1000:
+            reasons.append("Very high amplitude - likely artifacts")
+
+        # Check for flat segments
+        diff_data = np.diff(data)
+        flat_ratio = np.sum(np.abs(diff_data) < 1e-6) / len(diff_data)
+        if flat_ratio > 0.1:
+            reasons.append("Too many flat segments")
+
+        # Check for excessive high-frequency noise
+        high_freq_power = np.sum(np.abs(diff_data) > 50)
+        if high_freq_power > len(data) * 0.05:
+            reasons.append("Excessive high-frequency noise")
+
+        # Overall quality assessment
+        if len(reasons) == 0:
+            quality = "good"
+        elif len(reasons) <= 2:
+            quality = "fair"
+        else:
+            quality = "poor"
+
+        return {"quality": quality, "reasons": reasons, "amplitude": amplitude}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLE Protocol Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_command(feature_id: int, pdu_id: int, payload: bytes = b"") -> bytes:
@@ -258,50 +424,209 @@ class AttentionDataCollector:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Signal Processing for Attention
+# Enhanced Signal Processing Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def filter_signal(data: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Apply bandpass filter to remove artifacts."""
-    nyq = sample_rate / 2
-    # Bandpass filter: 1-40 Hz
-    sos = signal.butter(4, [1 / nyq, 40 / nyq], btype='band', output='sos')
-    return signal.sosfilt(sos, data)
+def process_attention_data_improved(ch1_data: np.ndarray, ch2_data: np.ndarray) -> dict:
+    """Enhanced attention data processing with artifact rejection."""
+    processor = ImprovedEEGProcessor(250)
 
+    # Validate input data
+    if len(ch1_data) < 500 or len(ch2_data) < 500:  # Need at least 2 seconds
+        print("Warning: Insufficient data for reliable analysis")
+        return {}
 
-def calculate_band_power(data: np.ndarray, sample_rate: int, freq_band: Tuple[float, float]) -> float:
-    """Calculate power in specific frequency band."""
-    freqs, psd = signal.welch(data, sample_rate, nperseg=sample_rate * 2, noverlap=sample_rate)
+    print(f"Processing {len(ch1_data)} samples ({len(ch1_data) / 250:.1f} seconds)")
 
-    # Find frequency band indices
-    band_mask = (freqs >= freq_band[0]) & (freqs <= freq_band[1])
+    # Preprocess signals
+    print("Applying artifact rejection and filtering...")
+    ch1_clean = processor.preprocess_signal(ch1_data)
+    ch2_clean = processor.preprocess_signal(ch2_data)
 
-    # Calculate mean power in band
-    band_power = np.mean(psd[band_mask])
+    # Validate data quality
+    ch1_quality = processor.validate_data_quality(ch1_clean)
+    ch2_quality = processor.validate_data_quality(ch2_clean)
 
-    return band_power
+    print(f"Channel 1 quality: {ch1_quality['quality']} - {ch1_quality.get('reasons', [])}")
+    print(f"Channel 2 quality: {ch2_quality['quality']} - {ch2_quality.get('reasons', [])}")
 
+    # Calculate frequency band powers
+    freq_bands = {
+        'theta': (4, 8),
+        'alpha': (8, 12),
+        'beta': (13, 30)
+    }
 
-def process_attention_data(ch1_data: np.ndarray, ch2_data: np.ndarray) -> dict:
-    """Process data and return attention-related frequency bands."""
-    # Filter the data
-    ch1_filtered = filter_signal(ch1_data, SAMPLE_RATE)
-    ch2_filtered = filter_signal(ch2_data, SAMPLE_RATE)
+    results = {
+        'ch1_quality': ch1_quality,
+        'ch2_quality': ch2_quality,
+        'data_length': len(ch1_data) / 250  # in seconds
+    }
 
-    results = {}
+    for band_name, freq_range in freq_bands.items():
+        ch1_power = processor.calculate_band_power_robust(ch1_clean, freq_range)
+        ch2_power = processor.calculate_band_power_robust(ch2_clean, freq_range)
 
-    # Calculate power in attention-related frequency bands
-    for band_name, freq_band in [('theta', THETA_BAND), ('alpha', ALPHA_BAND), ('beta', BETA_BAND)]:
-        ch1_power = calculate_band_power(ch1_filtered, SAMPLE_RATE, freq_band)
-        ch2_power = calculate_band_power(ch2_filtered, SAMPLE_RATE, freq_band)
         results[f'ch1_{band_name}'] = ch1_power
         results[f'ch2_{band_name}'] = ch2_power
+
+        print(
+            f"{band_name.capitalize()} ({freq_range[0]}-{freq_range[1]} Hz): CH1={ch1_power:.3f}, CH2={ch2_power:.3f}")
 
     return results
 
 
+def calculate_attention_indices(rest_data: dict, task_data: dict) -> dict:
+    """Calculate attention indices with validation."""
+    indices = {}
+    warnings = []
+
+    bands = ['theta', 'alpha', 'beta']
+    channels = ['ch1', 'ch2']
+
+    for band in bands:
+        for ch in channels:
+            rest_key = f'{ch}_{band}'
+
+            if rest_key not in rest_data or rest_key not in task_data:
+                continue
+
+            rest_power = rest_data[rest_key]
+            task_power = task_data[rest_key]
+
+            # Validate powers
+            if rest_power <= 0 or task_power <= 0:
+                warnings.append(f"{ch} {band}: Invalid power values")
+                continue
+
+            ratio = task_power / rest_power
+
+            # Check for unrealistic ratios
+            if ratio > 10:
+                warnings.append(f"{ch} {band}: Very high ratio ({ratio:.1f}) - possible artifacts")
+            elif ratio < 0.1:
+                warnings.append(f"{ch} {band}: Very low ratio ({ratio:.1f}) - possible artifacts")
+
+            indices[f'{ch}_{band}_ratio'] = ratio
+
+    if warnings:
+        print("Data quality warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+
+    return indices
+
+
+def plot_attention_analysis_improved(rest_results, task_results, indices):
+    """Create improved attention analysis plots with data quality indicators."""
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+
+    bands = ['Theta\n(4-8 Hz)', 'Alpha\n(8-12 Hz)', 'Beta\n(13-30 Hz)']
+    band_keys = ['theta', 'alpha', 'beta']
+
+    # Function to get values safely
+    def get_values(channel, results):
+        return [results.get(f'{channel}_{band}', 0) for band in band_keys]
+
+    # Channel 1 power comparison
+    ch1_rest = get_values('ch1', rest_results)
+    ch1_task = get_values('ch1', task_results)
+
+    x = np.arange(len(bands))
+    width = 0.35
+
+    bars1 = ax1.bar(x - width / 2, ch1_rest, width, label='Rest', color='lightblue', alpha=0.7)
+    bars2 = ax1.bar(x + width / 2, ch1_task, width, label='Attention Task', color='orange', alpha=0.7)
+
+    ax1.set_title('Channel 1 - Frequency Band Power', fontweight='bold')
+    ax1.set_ylabel('Power (µV²)')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(bands)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yscale('log')  # Log scale for better visualization
+
+    # Add quality indicator
+    quality1 = rest_results.get('ch1_quality', {}).get('quality', 'unknown')
+    ax1.text(0.02, 0.98, f'Data Quality: {quality1}', transform=ax1.transAxes,
+             verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    # Channel 2 power comparison
+    ch2_rest = get_values('ch2', rest_results)
+    ch2_task = get_values('ch2', task_results)
+
+    bars3 = ax2.bar(x - width / 2, ch2_rest, width, label='Rest', color='lightblue', alpha=0.7)
+    bars4 = ax2.bar(x + width / 2, ch2_task, width, label='Attention Task', color='orange', alpha=0.7)
+
+    ax2.set_title('Channel 2 - Frequency Band Power', fontweight='bold')
+    ax2.set_ylabel('Power (µV²)')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(bands)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_yscale('log')  # Log scale for better visualization
+
+    # Add quality indicator
+    quality2 = rest_results.get('ch2_quality', {}).get('quality', 'unknown')
+    ax2.text(0.02, 0.98, f'Data Quality: {quality2}', transform=ax2.transAxes,
+             verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    # Channel 1 ratios
+    ch1_ratios = [indices.get(f'ch1_{band}_ratio', 1) for band in band_keys]
+    colors1 = []
+    for i, ratio in enumerate(ch1_ratios):
+        if band_keys[i] == 'alpha':
+            colors1.append('green' if ratio < 1 else 'red')  # Alpha should decrease
+        else:
+            colors1.append('green' if ratio > 1 else 'red')  # Theta/Beta should increase
+
+    bars5 = ax3.bar(bands, ch1_ratios, color=colors1, alpha=0.7, edgecolor='black')
+    ax3.axhline(y=1, color='black', linestyle='--', alpha=0.5, label='Baseline')
+    ax3.set_title('Channel 1 - Attention Indices (Task/Rest)', fontweight='bold')
+    ax3.set_ylabel('Ratio')
+    ax3.set_ylim(0, min(5, max(ch1_ratios) * 1.1))  # Cap at reasonable values
+    ax3.grid(True, alpha=0.3)
+
+    for bar, ratio in zip(bars5, ch1_ratios):
+        height = bar.get_height()
+        ax3.text(bar.get_x() + bar.get_width() / 2., height + 0.02,
+                 f'{ratio:.2f}', ha='center', va='bottom', fontweight='bold')
+
+    # Channel 2 ratios
+    ch2_ratios = [indices.get(f'ch2_{band}_ratio', 1) for band in band_keys]
+    colors2 = []
+    for i, ratio in enumerate(ch2_ratios):
+        if band_keys[i] == 'alpha':
+            colors2.append('green' if ratio < 1 else 'red')  # Alpha should decrease
+        else:
+            colors2.append('green' if ratio > 1 else 'red')  # Theta/Beta should increase
+
+    bars6 = ax4.bar(bands, ch2_ratios, color=colors2, alpha=0.7, edgecolor='black')
+    ax4.axhline(y=1, color='black', linestyle='--', alpha=0.5, label='Baseline')
+    ax4.set_title('Channel 2 - Attention Indices (Task/Rest)', fontweight='bold')
+    ax4.set_ylabel('Ratio')
+    ax4.set_ylim(0, min(5, max(ch2_ratios) * 1.1))  # Cap at reasonable values
+    ax4.grid(True, alpha=0.3)
+
+    for bar, ratio in zip(bars6, ch2_ratios):
+        height = bar.get_height()
+        ax4.text(bar.get_x() + bar.get_width() / 2., height + 0.02,
+                 f'{ratio:.2f}', ha='center', va='bottom', fontweight='bold')
+
+    plt.tight_layout()
+    plt.suptitle('Enhanced Attention Assessment with Artifact Rejection',
+                 fontsize=16, fontweight='bold', y=1.02)
+
+    # Add interpretation guide
+    fig.text(0.5, 0.01,
+             'Expected: ↑Theta (attention), ↓Alpha (alertness), ↑Beta (focus). Green=Good, Red=Poor/Artifacts',
+             ha='center', fontsize=10, style='italic')
+
+    plt.show()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Attention Experiment
+# Enhanced Attention Experiment
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AttentionExperiment:
@@ -496,142 +821,67 @@ class AttentionExperiment:
         print(f"\n✅ Recovery recording complete!")
 
     def analyze_attention(self):
-        """Analyze attention using frequency band analysis."""
+        """Enhanced attention analysis with better data handling."""
         if self.rest_data is None or self.attention_data is None:
             print("Error: Missing data for analysis")
             return
 
         print(f"\n{'=' * 70}")
-        print("ANALYZING ATTENTION MARKERS")
+        print("ENHANCED ATTENTION ANALYSIS")
         print(f"{'=' * 70}")
 
-        # Process data
-        rest_bands = process_attention_data(*self.rest_data)
-        attention_bands = process_attention_data(*self.attention_data)
+        # Process data with improved methods
+        print("\nProcessing REST data:")
+        rest_results = process_attention_data_improved(*self.rest_data)
 
-        # Calculate attention indices
-        results = {}
-        for band in ['theta', 'alpha', 'beta']:
+        print("\nProcessing ATTENTION TASK data:")
+        task_results = process_attention_data_improved(*self.attention_data)
+
+        if not rest_results or not task_results:
+            print("Error: Could not process data")
+            return
+
+        # Calculate indices with validation
+        print("\nCalculating attention indices...")
+        indices = calculate_attention_indices(rest_results, task_results)
+
+        # Display results
+        print(f"\n{'=' * 50}")
+        print("IMPROVED ATTENTION RESULTS:")
+        print(f"{'=' * 50}")
+
+        bands = ['theta', 'alpha', 'beta']
+        band_ranges = ['(4-8 Hz)', '(8-12 Hz)', '(13-30 Hz)']
+
+        for i, (band, range_str) in enumerate(zip(bands, band_ranges)):
+            print(f"\n{band.upper()} {range_str}:")
+
             for ch in ['ch1', 'ch2']:
-                key = f'{ch}_{band}'
-                rest_power = rest_bands[key]
-                attention_power = attention_bands[key]
-                ratio = attention_power / rest_power
-                results[f'{key}_ratio'] = ratio
+                rest_key = f'{ch}_{band}'
+                ratio_key = f'{ch}_{band}_ratio'
 
-        # Print results
-        print(f"\nATTENTION ANALYSIS RESULTS:")
-        print(f"\nChannel 1:")
-        print(
-            f"  Theta (4-8 Hz) - Rest: {rest_bands['ch1_theta']:.2f}, Task: {attention_bands['ch1_theta']:.2f}, Ratio: {results['ch1_theta_ratio']:.2f}")
-        print(
-            f"  Alpha (8-12 Hz) - Rest: {rest_bands['ch1_alpha']:.2f}, Task: {attention_bands['ch1_alpha']:.2f}, Ratio: {results['ch1_alpha_ratio']:.2f}")
-        print(
-            f"  Beta (13-30 Hz) - Rest: {rest_bands['ch1_beta']:.2f}, Task: {attention_bands['ch1_beta']:.2f}, Ratio: {results['ch1_beta_ratio']:.2f}")
+                if rest_key in rest_results and rest_key in task_results:
+                    rest_val = rest_results[rest_key]
+                    task_val = task_results[rest_key]
+                    ratio_val = indices.get(ratio_key, 0)
 
-        print(f"\nChannel 2:")
-        print(
-            f"  Theta (4-8 Hz) - Rest: {rest_bands['ch2_theta']:.2f}, Task: {attention_bands['ch2_theta']:.2f}, Ratio: {results['ch2_theta_ratio']:.2f}")
-        print(
-            f"  Alpha (8-12 Hz) - Rest: {rest_bands['ch2_alpha']:.2f}, Task: {attention_bands['ch2_alpha']:.2f}, Ratio: {results['ch2_alpha_ratio']:.2f}")
-        print(
-            f"  Beta (13-30 Hz) - Rest: {rest_bands['ch2_beta']:.2f}, Task: {attention_bands['ch2_beta']:.2f}, Ratio: {results['ch2_beta_ratio']:.2f}")
+                    print(f"  {ch.upper()}: Rest={rest_val:.3f}, Task={task_val:.3f}, Ratio={ratio_val:.2f}")
 
-        # Create attention analysis plot
-        self.plot_attention_analysis(rest_bands, attention_bands, results)
+                    # Interpretation
+                    if band == 'theta' and ratio_val > 1.2:
+                        print(f"    ✓ Good attention/working memory engagement")
+                    elif band == 'alpha' and ratio_val < 0.8:
+                        print(f"    ✓ Good alertness (alpha suppression)")
+                    elif band == 'beta' and ratio_val > 1.1:
+                        print(f"    ✓ Good focused attention")
+                    else:
+                        print(f"    ? Ratio within normal range or possible artifacts")
 
-    def plot_attention_analysis(self, rest_bands, attention_bands, ratios):
-        """Create comprehensive attention analysis plot."""
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-
-        # Channel 1 frequency bands
-        bands = ['Theta\n(4-8 Hz)', 'Alpha\n(8-12 Hz)', 'Beta\n(13-30 Hz)']
-        ch1_rest = [rest_bands['ch1_theta'], rest_bands['ch1_alpha'], rest_bands['ch1_beta']]
-        ch1_task = [attention_bands['ch1_theta'], attention_bands['ch1_alpha'], attention_bands['ch1_beta']]
-
-        x = np.arange(len(bands))
-        width = 0.35
-
-        bars1 = ax1.bar(x - width / 2, ch1_rest, width, label='Rest', color='lightblue', alpha=0.7)
-        bars2 = ax1.bar(x + width / 2, ch1_task, width, label='Attention Task', color='orange', alpha=0.7)
-
-        ax1.set_title('Channel 1 - Attention-Related Frequency Bands', fontweight='bold')
-        ax1.set_ylabel('Power (µV²)')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(bands)
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-
-        # Add value labels
-        for bars in [bars1, bars2]:
-            for bar in bars:
-                height = bar.get_height()
-                ax1.text(bar.get_x() + bar.get_width() / 2., height,
-                         f'{height:.1f}', ha='center', va='bottom', fontsize=9)
-
-        # Channel 2 frequency bands
-        ch2_rest = [rest_bands['ch2_theta'], rest_bands['ch2_alpha'], rest_bands['ch2_beta']]
-        ch2_task = [attention_bands['ch2_theta'], attention_bands['ch2_alpha'], attention_bands['ch2_beta']]
-
-        bars3 = ax2.bar(x - width / 2, ch2_rest, width, label='Rest', color='lightblue', alpha=0.7)
-        bars4 = ax2.bar(x + width / 2, ch2_task, width, label='Attention Task', color='orange', alpha=0.7)
-
-        ax2.set_title('Channel 2 - Attention-Related Frequency Bands', fontweight='bold')
-        ax2.set_ylabel('Power (µV²)')
-        ax2.set_xticks(x)
-        ax2.set_xticklabels(bands)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-
-        # Add value labels
-        for bars in [bars3, bars4]:
-            for bar in bars:
-                height = bar.get_height()
-                ax2.text(bar.get_x() + bar.get_width() / 2., height,
-                         f'{height:.1f}', ha='center', va='bottom', fontsize=9)
-
-        # Attention ratios Channel 1
-        ch1_ratios = [ratios['ch1_theta_ratio'], ratios['ch1_alpha_ratio'], ratios['ch1_beta_ratio']]
-        colors = ['green' if r > 1 else 'red' for r in ch1_ratios]
-
-        bars5 = ax3.bar(bands, ch1_ratios, color=colors, alpha=0.7, edgecolor='black')
-        ax3.axhline(y=1, color='black', linestyle='--', alpha=0.5)
-        ax3.set_title('Channel 1 - Attention Indices (Task/Rest)', fontweight='bold')
-        ax3.set_ylabel('Ratio')
-        ax3.grid(True, alpha=0.3)
-
-        # Add value labels and interpretation
-        for bar, ratio in zip(bars5, ch1_ratios):
-            height = bar.get_height()
-            ax3.text(bar.get_x() + bar.get_width() / 2., height + 0.02,
-                     f'{ratio:.2f}', ha='center', va='bottom', fontweight='bold')
-
-        # Attention ratios Channel 2
-        ch2_ratios = [ratios['ch2_theta_ratio'], ratios['ch2_alpha_ratio'], ratios['ch2_beta_ratio']]
-        colors = ['green' if r > 1 else 'red' for r in ch2_ratios]
-
-        bars6 = ax4.bar(bands, ch2_ratios, color=colors, alpha=0.7, edgecolor='black')
-        ax4.axhline(y=1, color='black', linestyle='--', alpha=0.5)
-        ax4.set_title('Channel 2 - Attention Indices (Task/Rest)', fontweight='bold')
-        ax4.set_ylabel('Ratio')
-        ax4.grid(True, alpha=0.3)
-
-        # Add value labels
-        for bar, ratio in zip(bars6, ch2_ratios):
-            height = bar.get_height()
-            ax4.text(bar.get_x() + bar.get_width() / 2., height + 0.02,
-                     f'{ratio:.2f}', ha='center', va='bottom', fontweight='bold')
-
-        plt.tight_layout()
-        plt.suptitle('Attention Assessment: Visual Oddball Paradigm Results',
-                     fontsize=16, fontweight='bold', y=1.02)
-
-        # Add interpretation text
-        fig.text(0.5, 0.01,
-                 'Expected: ↑Theta (attention/memory), ↓Alpha (reduced relaxation), ↑Beta (focused attention)',
-                 ha='center', fontsize=10, style='italic')
-
-        plt.show()
+        # Create improved visualization
+        if indices:
+            plot_attention_analysis_improved(rest_results, task_results, indices)
+        else:
+            print("Could not create plots due to data quality issues")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -639,13 +889,14 @@ class AttentionExperiment:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def main():
-    print("Neocore EEG Attention Assessment")
-    print("Visual Oddball Paradigm")
+    print("Neocore EEG Enhanced Attention Assessment")
+    print("Visual Oddball Paradigm with Artifact Rejection")
     print("=" * 70)
     print(f"Number of trials: {NUM_TRIALS}")
     print(f"Target probability: {TARGET_PROBABILITY * 100:.0f}%")
     print(f"Rest periods: {REST_TIME_SEC} seconds each")
     print("Frequency bands: Theta (4-8), Alpha (8-12), Beta (13-30) Hz")
+    print("Enhanced with artifact rejection and data quality validation")
     print("=" * 70)
 
     target_mac = None
