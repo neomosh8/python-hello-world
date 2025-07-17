@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
 """
-Neocore EEG Attention Assessment - Enhanced Visual Oddball Paradigm
-Complete implementation with artifact rejection and improved analysis
+Neocore EEG Attention/Engagement Measurement System
+Advanced cognitive task paradigm with real-time attention analysis
 """
 
 import asyncio
 import sys
 import struct
 import time
-import random
+import json
+import os
 from collections import deque
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
+from datetime import datetime
+import threading
+from dataclasses import dataclass
+import queue
 
 import numpy as np
-from scipy import signal, stats
+from scipy import signal
+from scipy.stats import ttest_rel
+import matplotlib
+
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+
 from bleak import BleakScanner, BleakClient
+import openai
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BLE Configuration
+# Configuration & Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# BLE Configuration (from original code)
 RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 TARGET_NAMES = {"QCC5181", "QCC5181-LE", "NEOCORE"}
@@ -29,193 +43,688 @@ FEATURE_SENSOR_CFG = 0x01
 CMD_STREAM_CTRL = 0x00
 PDU_TYPE_COMMAND = 0x00
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Attention Task Parameters
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# Signal Parameters
 SAMPLE_RATE = 250
 SAMPLES_PER_CHUNK = 27
 NUM_CHANNELS = 2
-NUM_TRIALS = 20  # Total number of stimuli
-TARGET_PROBABILITY = 0.2  # 20% targets, 80% standards
-STIMULUS_DURATION = 1.5  # seconds per stimulus
-ISI_RANGE = (0.8, 1.2)  # Inter-stimulus interval range (seconds)
-REST_TIME_SEC = 10  # 1 minute rest periods
+WINDOW_SIZE = SAMPLE_RATE * 2  # 2-second analysis window
 
-# Frequency bands for attention analysis
-THETA_BAND = (4, 8)  # Attention and working memory
-ALPHA_BAND = (8, 12)  # Alertness (decreases with attention)
-BETA_BAND = (13, 30)  # Focused attention
+# Experiment Configuration
+REST_DURATION = 120  # 2 minutes
+TASK_DURATION = 180  # 3 minutes
+NUM_CYCLES = 3
+
+# Frequency Bands for Attention Analysis
+BANDS = {
+    'delta': (1, 4),
+    'theta': (4, 8),
+    'alpha': (8, 12),
+    'beta': (13, 30),
+    'gamma': (30, 45)
+}
+
+
+@dataclass
+class AttentionMetrics:
+    """Container for attention measurement results"""
+    timestamp: float
+    alpha_power: float
+    beta_power: float
+    theta_power: float
+    attention_index: float
+    engagement_score: float
+    state: str  # 'rest' or 'task'
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Enhanced Signal Processing with Artifact Rejection
+# OpenAI Integration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class ImprovedEEGProcessor:
-    """Enhanced EEG processing with artifact rejection and validation."""
+class AITaskGenerator:
+    """Generates comprehension tasks using OpenAI API"""
 
-    def __init__(self, sample_rate=250):
-        self.fs = sample_rate
-        self.setup_filters()
+    def __init__(self, api_key: str):
+        self.client = openai.OpenAI(api_key=api_key)
+        self.difficulty_level = 1
 
-    def setup_filters(self):
-        """Setup filtering parameters."""
-        nyq = self.fs / 2
+    def generate_passage_and_questions(self, difficulty: int = 1) -> Dict:
+        """Generate reading passage with comprehension questions"""
 
-        # More aggressive artifact removal
-        # Bandpass: 0.5-45 Hz (removes DC drift and high-freq noise)
-        self.bp_sos = signal.butter(6, [0.5 / nyq, 45 / nyq], btype='band', output='sos')
+        difficulty_prompts = {
+            1: "elementary level, simple vocabulary and concepts",
+            2: "middle school level, moderate complexity",
+            3: "high school level, complex ideas and vocabulary",
+            4: "college level, abstract concepts and analysis"
+        }
 
-        # Notch filters for line noise - FIXED: convert to SOS format
-        notch_60_b, notch_60_a = signal.iirnotch(60, 30, self.fs)
-        self.notch_60_sos = signal.tf2sos(notch_60_b, notch_60_a)
+        prompt = f"""Generate a short reading passage ({150 + difficulty * 50} words) at {difficulty_prompts[difficulty]} 
+        followed by 3 multiple choice questions testing comprehension. 
 
-        notch_50_b, notch_50_a = signal.iirnotch(50, 25, self.fs)
-        self.notch_50_sos = signal.tf2sos(notch_50_b, notch_50_a)
+        Format your response as JSON:
+        {{
+            "passage": "text here",
+            "questions": [
+                {{
+                    "question": "question text",
+                    "options": ["A) option1", "B) option2", "C) option3", "D) option4"],
+                    "correct": "A"
+                }}
+            ]
+        }}
 
-    def preprocess_signal(self, data: np.ndarray) -> np.ndarray:
-        """Apply comprehensive preprocessing."""
-        if len(data) < self.fs:  # Need at least 1 second of data
-            return data
-
-        try:
-            # Remove extreme outliers (likely artifacts)
-            data = self.remove_extreme_outliers(data)
-
-            # Apply bandpass filter
-            filtered = signal.sosfilt(self.bp_sos, data)
-
-            # Apply notch filters
-            filtered = signal.sosfilt(self.notch_60_sos, filtered)
-            filtered = signal.sosfilt(self.notch_50_sos, filtered)
-
-            # Remove remaining artifacts
-            filtered = self.artifact_rejection(filtered)
-
-            return filtered
-
-        except Exception as e:
-            print(f"Error in preprocessing: {e}")
-            # Return basic filtered data if advanced processing fails
-            try:
-                return signal.sosfilt(self.bp_sos, data)
-            except:
-                return data
-
-    def remove_extreme_outliers(self, data: np.ndarray, threshold_std=5) -> np.ndarray:
-        """Remove extreme outliers that are likely artifacts."""
-        mean_val = np.mean(data)
-        std_val = np.std(data)
-
-        # Clip values beyond threshold_std standard deviations
-        lower_bound = mean_val - threshold_std * std_val
-        upper_bound = mean_val + threshold_std * std_val
-
-        return np.clip(data, lower_bound, upper_bound)
-
-    def artifact_rejection(self, data: np.ndarray, window_size=1.0) -> np.ndarray:
-        """Reject segments with high amplitude or gradient (artifacts)."""
-        if len(data) < self.fs:
-            return data
-
-        window_samples = int(window_size * self.fs)
-        cleaned_data = data.copy()
-
-        # Sliding window artifact detection
-        for i in range(0, len(data) - window_samples, window_samples // 2):
-            segment = data[i:i + window_samples]
-
-            # Check for high amplitude artifacts
-            if np.max(np.abs(segment)) > 200:  # Adjust threshold as needed
-                # Replace with interpolated values
-                if i > 0 and i + window_samples < len(data):
-                    start_val = data[i - 1]
-                    end_val = data[i + window_samples]
-                    cleaned_data[i:i + window_samples] = np.linspace(start_val, end_val, window_samples)
-
-            # Check for high gradient (muscle artifacts)
-            gradient = np.abs(np.diff(segment))
-            if np.mean(gradient) > 50:  # Adjust threshold as needed
-                if i > 0 and i + window_samples < len(data):
-                    start_val = data[i - 1]
-                    end_val = data[i + window_samples]
-                    cleaned_data[i:i + window_samples] = np.linspace(start_val, end_val, window_samples)
-
-        return cleaned_data
-
-    def calculate_band_power_robust(self, data: np.ndarray, freq_band: Tuple[float, float]) -> float:
-        """Calculate band power with robust spectral estimation."""
-        if len(data) < 2 * self.fs:  # Need at least 2 seconds
-            return 0.0
+        Topic: science, technology, or current events. Make it engaging and thought-provoking."""
 
         try:
-            # Use Welch's method with more conservative parameters
-            nperseg = min(self.fs * 2, len(data) // 4)  # 2-second windows or 1/4 of data
-            noverlap = nperseg // 2
-
-            freqs, psd = signal.welch(
-                data,
-                self.fs,
-                nperseg=nperseg,
-                noverlap=noverlap,
-                window='hann',
-                detrend='constant'
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7
             )
 
-            # Find frequency band
-            band_mask = (freqs >= freq_band[0]) & (freqs <= freq_band[1])
+            content = response.choices[0].message.content
+            # Extract JSON from response
+            start_idx = content.find('{')
+            end_idx = content.rfind('}') + 1
+            json_str = content[start_idx:end_idx]
 
-            if not np.any(band_mask):
-                return 0.0
-
-            # Calculate power (integrate PSD)
-            freq_res = freqs[1] - freqs[0]
-            band_power = np.sum(psd[band_mask]) * freq_res
-
-            return band_power
+            return json.loads(json_str)
 
         except Exception as e:
-            print(f"Error calculating band power: {e}")
-            return 0.0
+            print(f"AI generation error: {e}")
+            return self._fallback_task()
 
-    def validate_data_quality(self, data: np.ndarray) -> dict:
-        """Assess data quality metrics."""
-        if len(data) == 0:
-            return {"quality": "poor", "reasons": ["No data"]}
+    def _fallback_task(self) -> Dict:
+        """Fallback task if AI fails"""
+        return {
+            "passage": """Artificial intelligence has transformed many aspects of modern life. 
+            From recommendation systems that suggest what to watch or buy, to autonomous vehicles 
+            that can navigate complex traffic situations, AI systems are becoming increasingly 
+            sophisticated. However, these advances also raise important questions about privacy, 
+            employment, and the role of human judgment in critical decisions.""",
+            "questions": [
+                {
+                    "question": "What is the main topic of this passage?",
+                    "options": ["A) Transportation", "B) AI in modern life", "C) Privacy concerns", "D) Employment"],
+                    "correct": "B"
+                },
+                {
+                    "question": "According to the passage, AI raises questions about:",
+                    "options": ["A) Only privacy", "B) Only employment", "C) Privacy and employment",
+                                "D) Traffic navigation"],
+                    "correct": "C"
+                }
+            ]
+        }
 
-        reasons = []
-
-        # Check signal amplitude
-        amplitude = np.max(data) - np.min(data)
-        if amplitude < 10:
-            reasons.append("Very low amplitude")
-        elif amplitude > 1000:
-            reasons.append("Very high amplitude - likely artifacts")
-
-        # Check for flat segments
-        diff_data = np.diff(data)
-        flat_ratio = np.sum(np.abs(diff_data) < 1e-6) / len(diff_data)
-        if flat_ratio > 0.1:
-            reasons.append("Too many flat segments")
-
-        # Check for excessive high-frequency noise
-        high_freq_power = np.sum(np.abs(diff_data) > 50)
-        if high_freq_power > len(data) * 0.05:
-            reasons.append("Excessive high-frequency noise")
-
-        # Overall quality assessment
-        if len(reasons) == 0:
-            quality = "good"
-        elif len(reasons) <= 2:
-            quality = "fair"
-        else:
-            quality = "poor"
-
-        return {"quality": quality, "reasons": reasons, "amplitude": amplitude}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BLE Protocol Functions
+# Attention Analysis Engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AttentionAnalyzer:
+    """Real-time attention metrics calculation from EEG data"""
+
+    def __init__(self, sample_rate: int = SAMPLE_RATE):
+        self.fs = sample_rate
+        self.window_size = WINDOW_SIZE
+
+        # Data buffers for analysis
+        self.ch1_buffer = deque(maxlen=self.window_size)
+        self.ch2_buffer = deque(maxlen=self.window_size)
+
+        # Results storage
+        self.attention_history = []
+
+    def add_data(self, ch1_data: np.ndarray, ch2_data: np.ndarray):
+        """Add new EEG data to analysis buffers"""
+        self.ch1_buffer.extend(ch1_data)
+        self.ch2_buffer.extend(ch2_data)
+
+    def calculate_attention_metrics(self, state: str) -> Optional[AttentionMetrics]:
+        """Calculate current attention metrics"""
+        if len(self.ch1_buffer) < self.window_size:
+            return None
+
+        # Get current window data
+        ch1_data = np.array(list(self.ch1_buffer))
+        ch2_data = np.array(list(self.ch2_buffer))
+
+        # Calculate power spectral density
+        freqs1, psd1 = signal.welch(ch1_data, self.fs, nperseg=self.fs)
+        freqs2, psd2 = signal.welch(ch2_data, self.fs, nperseg=self.fs)
+
+        # Average power across channels
+        psd_avg = (psd1 + psd2) / 2
+
+        # Calculate band powers
+        band_powers = {}
+        for band, (low, high) in BANDS.items():
+            idx = np.where((freqs1 >= low) & (freqs1 <= high))[0]
+            band_powers[band] = np.mean(psd_avg[idx])
+
+        # Calculate attention metrics
+        alpha_power = band_powers['alpha']
+        beta_power = band_powers['beta']
+        theta_power = band_powers['theta']
+
+        # Attention Index: Beta / (Alpha + Theta)
+        attention_index = beta_power / (alpha_power + theta_power + 1e-10)
+
+        # Engagement Score: (Beta + Gamma) / (Alpha + Theta + Delta)
+        engagement_score = (band_powers['beta'] + band_powers['gamma']) / \
+                           (band_powers['alpha'] + band_powers['theta'] + band_powers['delta'] + 1e-10)
+
+        metrics = AttentionMetrics(
+            timestamp=time.time(),
+            alpha_power=alpha_power,
+            beta_power=beta_power,
+            theta_power=theta_power,
+            attention_index=attention_index,
+            engagement_score=engagement_score,
+            state=state
+        )
+
+        self.attention_history.append(metrics)
+        return metrics
+
+    def get_state_averages(self, state: str) -> Dict:
+        """Get average metrics for a specific state"""
+        state_metrics = [m for m in self.attention_history if m.state == state]
+        if not state_metrics:
+            return {}
+
+        return {
+            'attention_index': np.mean([m.attention_index for m in state_metrics]),
+            'engagement_score': np.mean([m.engagement_score for m in state_metrics]),
+            'alpha_power': np.mean([m.alpha_power for m in state_metrics]),
+            'beta_power': np.mean([m.beta_power for m in state_metrics]),
+            'count': len(state_metrics)
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Experiment Controller
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ExperimentController:
+    """Manages the attention measurement experiment"""
+
+    def __init__(self, ai_generator: AITaskGenerator, attention_analyzer: AttentionAnalyzer):
+        self.ai_generator = ai_generator
+        self.attention_analyzer = attention_analyzer
+
+        # Experiment state
+        self.current_state = 'idle'
+        self.current_cycle = 0
+        self.experiment_running = False
+        self.state_start_time = 0
+
+        # Task data
+        self.current_task = None
+        self.task_responses = []
+
+        # Thread-safe communication
+        self.gui_queue = queue.Queue()
+
+    def start_experiment(self):
+        """Start the attention measurement experiment"""
+        self.experiment_running = True
+        self.current_cycle = 0
+        self.attention_analyzer.attention_history.clear()
+        self._start_rest_period()
+
+    def stop_experiment(self):
+        """Stop the experiment"""
+        self.experiment_running = False
+        self.current_state = 'idle'
+
+    def _start_rest_period(self):
+        """Begin rest period"""
+        self.current_state = 'rest'
+        self.state_start_time = time.time()
+        print(f"Starting REST period {self.current_cycle + 1}")
+
+        self.gui_queue.put(('state_change', 'rest', REST_DURATION))
+
+    def _start_task_period(self):
+        """Begin task period"""
+        self.current_state = 'task'
+        self.state_start_time = time.time()
+
+        # Generate new task in separate thread to avoid blocking
+        def generate_task():
+            task_data = self.ai_generator.generate_passage_and_questions()
+            self.current_task = task_data
+            self.gui_queue.put(('task_generated', task_data))
+
+        task_thread = threading.Thread(target=generate_task, daemon=True)
+        task_thread.start()
+
+        print(f"Starting TASK period {self.current_cycle + 1}")
+        self.gui_queue.put(('state_change', 'task', TASK_DURATION))
+
+    def update(self):
+        """Update experiment state (call regularly)"""
+        if not self.experiment_running:
+            return
+
+        elapsed = time.time() - self.state_start_time
+
+        if self.current_state == 'rest' and elapsed >= REST_DURATION:
+            self._start_task_period()
+        elif self.current_state == 'task' and elapsed >= TASK_DURATION:
+            self.current_cycle += 1
+            if self.current_cycle < NUM_CYCLES:
+                self._start_rest_period()
+            else:
+                self._finish_experiment()
+
+    def _finish_experiment(self):
+        """Complete the experiment"""
+        self.experiment_running = False
+        self.current_state = 'complete'
+        print("Experiment completed!")
+
+        self.gui_queue.put(('state_change', 'complete', 0))
+
+    def record_task_response(self, question_idx: int, selected_answer: str):
+        """Record participant's response to task question"""
+        if self.current_task and question_idx < len(self.current_task['questions']):
+            correct = self.current_task['questions'][question_idx]['correct']
+            is_correct = selected_answer == correct
+
+            response = {
+                'timestamp': time.time(),
+                'cycle': self.current_cycle,
+                'question_idx': question_idx,
+                'selected': selected_answer,
+                'correct': correct,
+                'is_correct': is_correct
+            }
+            self.task_responses.append(response)
+            return is_correct
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUI Interface (Fixed for main thread)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AttentionExperimentGUI:
+    """Main GUI for attention measurement experiment"""
+
+    def __init__(self, experiment_controller: ExperimentController):
+        self.controller = experiment_controller
+
+        # Create GUI
+        self.root = tk.Tk()
+        self.root.title("EEG Attention Measurement System")
+        self.root.geometry("1000x700")
+
+        self.setup_gui()
+
+        # Current task tracking
+        self.current_question_idx = 0
+
+        # Start queue processing
+        self.process_queue()
+
+    def setup_gui(self):
+        """Set up the GUI layout"""
+        # Main notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Experiment tab
+        self.exp_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.exp_frame, text="Experiment")
+
+        # Real-time metrics tab
+        self.metrics_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.metrics_frame, text="Real-time Metrics")
+
+        # Results tab
+        self.results_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.results_frame, text="Analysis Results")
+
+        self.setup_experiment_tab()
+        self.setup_metrics_tab()
+        self.setup_results_tab()
+
+    def setup_experiment_tab(self):
+        """Set up experiment control interface"""
+        # Control panel
+        control_frame = ttk.LabelFrame(self.exp_frame, text="Experiment Control")
+        control_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.start_btn = ttk.Button(control_frame, text="Start Experiment",
+                                    command=self.start_experiment)
+        self.start_btn.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.stop_btn = ttk.Button(control_frame, text="Stop Experiment",
+                                   command=self.stop_experiment, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Status display
+        self.status_var = tk.StringVar(value="Ready to start")
+        status_label = ttk.Label(control_frame, textvariable=self.status_var)
+        status_label.pack(side=tk.LEFT, padx=20)
+
+        # Progress bar
+        self.progress_var = tk.IntVar()
+        self.progress_bar = ttk.Progressbar(control_frame, variable=self.progress_var)
+        self.progress_bar.pack(side=tk.RIGHT, padx=5, pady=5, fill=tk.X, expand=True)
+
+        # Task display area
+        task_frame = ttk.LabelFrame(self.exp_frame, text="Current Task")
+        task_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Passage display
+        self.passage_text = scrolledtext.ScrolledText(task_frame, height=8, wrap=tk.WORD)
+        self.passage_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Question area
+        question_frame = ttk.Frame(task_frame)
+        question_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.question_label = ttk.Label(question_frame, text="", wraplength=600)
+        self.question_label.pack(anchor=tk.W)
+
+        # Answer options
+        self.answer_var = tk.StringVar()
+        self.option_buttons = []
+        for i in range(4):
+            btn = ttk.Radiobutton(question_frame, text="", variable=self.answer_var,
+                                  value=chr(ord('A') + i))
+            btn.pack(anchor=tk.W, pady=2)
+            self.option_buttons.append(btn)
+
+        # Submit button
+        self.submit_btn = ttk.Button(question_frame, text="Submit Answer",
+                                     command=self.submit_answer, state=tk.DISABLED)
+        self.submit_btn.pack(pady=10)
+
+    def setup_metrics_tab(self):
+        """Set up real-time metrics display"""
+        # Current metrics
+        current_frame = ttk.LabelFrame(self.metrics_frame, text="Current Metrics")
+        current_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.attention_var = tk.StringVar(value="Attention Index: --")
+        self.engagement_var = tk.StringVar(value="Engagement Score: --")
+        self.state_var = tk.StringVar(value="State: Idle")
+
+        ttk.Label(current_frame, textvariable=self.attention_var).pack(anchor=tk.W, padx=5, pady=2)
+        ttk.Label(current_frame, textvariable=self.engagement_var).pack(anchor=tk.W, padx=5, pady=2)
+        ttk.Label(current_frame, textvariable=self.state_var).pack(anchor=tk.W, padx=5, pady=2)
+
+    def setup_results_tab(self):
+        """Set up results analysis display"""
+        # Analysis button
+        analyze_btn = ttk.Button(self.results_frame, text="Generate Analysis",
+                                 command=self.generate_analysis)
+        analyze_btn.pack(pady=10)
+
+        # Results text
+        self.results_text = scrolledtext.ScrolledText(self.results_frame, height=20)
+        self.results_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def process_queue(self):
+        """Process messages from experiment controller"""
+        try:
+            while True:
+                message = self.controller.gui_queue.get_nowait()
+                msg_type = message[0]
+
+                if msg_type == 'state_change':
+                    self.on_state_change(message[1], message[2])
+                elif msg_type == 'task_generated':
+                    self.on_task_generated(message[1])
+                elif msg_type == 'metrics_update':
+                    self.update_metrics_display(message[1])
+
+        except queue.Empty:
+            pass
+
+        # Schedule next check
+        self.root.after(100, self.process_queue)
+
+    def start_experiment(self):
+        """Start the experiment"""
+        self.controller.start_experiment()
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+
+    def stop_experiment(self):
+        """Stop the experiment"""
+        self.controller.stop_experiment()
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+
+    def on_state_change(self, state: str, duration: int):
+        """Handle experiment state changes"""
+        if state == 'rest':
+            self.status_var.set(f"REST period - Relax and breathe normally")
+            self.passage_text.delete(1.0, tk.END)
+            self.passage_text.insert(tk.END,
+                                     "REST PERIOD\n\nPlease sit quietly and relax.\nTry to clear your mind and breathe normally.\nAvoid excessive movement.")
+            self.question_label.config(text="")
+            for btn in self.option_buttons:
+                btn.config(text="", state=tk.DISABLED)
+            self.submit_btn.config(state=tk.DISABLED)
+
+        elif state == 'task':
+            self.status_var.set(f"TASK period - Read carefully and answer questions")
+
+        elif state == 'complete':
+            self.status_var.set("Experiment completed! Check Analysis tab for results.")
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+
+    def on_task_generated(self, task_data: Dict):
+        """Handle new task generation"""
+        # Display passage
+        self.passage_text.delete(1.0, tk.END)
+        self.passage_text.insert(tk.END, "READING TASK\n\n" + task_data['passage'])
+
+        # Start with first question
+        self.current_question_idx = 0
+        self.show_current_question()
+
+    def show_current_question(self):
+        """Display current question"""
+        if not self.controller.current_task:
+            return
+
+        questions = self.controller.current_task['questions']
+        if self.current_question_idx >= len(questions):
+            self.question_label.config(text="All questions completed!")
+            for btn in self.option_buttons:
+                btn.config(state=tk.DISABLED)
+            self.submit_btn.config(state=tk.DISABLED)
+            return
+
+        question = questions[self.current_question_idx]
+        self.question_label.config(text=f"Question {self.current_question_idx + 1}: {question['question']}")
+
+        for i, option in enumerate(question['options']):
+            self.option_buttons[i].config(text=option, state=tk.NORMAL)
+
+        self.answer_var.set("")
+        self.submit_btn.config(state=tk.NORMAL)
+
+    def submit_answer(self):
+        """Submit current answer"""
+        selected = self.answer_var.get()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select an answer before submitting.")
+            return
+
+        is_correct = self.controller.record_task_response(self.current_question_idx, selected)
+
+        # Show feedback
+        if is_correct:
+            messagebox.showinfo("Correct!", "That's the correct answer!")
+        else:
+            correct_answer = self.controller.current_task['questions'][self.current_question_idx]['correct']
+            messagebox.showinfo("Incorrect", f"The correct answer was {correct_answer}")
+
+        # Move to next question
+        self.current_question_idx += 1
+        self.show_current_question()
+
+    def update_metrics_display(self, metrics: AttentionMetrics):
+        """Update real-time metrics display"""
+        self.attention_var.set(f"Attention Index: {metrics.attention_index:.3f}")
+        self.engagement_var.set(f"Engagement Score: {metrics.engagement_score:.3f}")
+        self.state_var.set(f"State: {metrics.state.upper()}")
+
+    def generate_analysis(self):
+        """Generate and display analysis results"""
+        analyzer = self.controller.attention_analyzer
+
+        if not analyzer.attention_history:
+            self.results_text.delete(1.0, tk.END)
+            self.results_text.insert(tk.END, "No data available for analysis. Run experiment first.")
+            return
+
+        # Calculate statistics
+        rest_metrics = analyzer.get_state_averages('rest')
+        task_metrics = analyzer.get_state_averages('task')
+
+        # Statistical comparison
+        rest_attention = [m.attention_index for m in analyzer.attention_history if m.state == 'rest']
+        task_attention = [m.attention_index for m in analyzer.attention_history if m.state == 'task']
+
+        # Performance analysis
+        correct_responses = sum(1 for r in self.controller.task_responses if r['is_correct'])
+        total_responses = len(self.controller.task_responses)
+        accuracy = (correct_responses / total_responses * 100) if total_responses > 0 else 0
+
+        # Generate report
+        report = f"""
+EEG ATTENTION MEASUREMENT ANALYSIS REPORT
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+EXPERIMENT SUMMARY:
+- Total cycles completed: {self.controller.current_cycle}
+- Total data points: {len(analyzer.attention_history)}
+- Task accuracy: {accuracy:.1f}% ({correct_responses}/{total_responses})
+
+ATTENTION METRICS COMPARISON:
+
+REST STATE:
+- Average Attention Index: {rest_metrics.get('attention_index', 0):.3f}
+- Average Engagement Score: {rest_metrics.get('engagement_score', 0):.3f}
+- Data points: {rest_metrics.get('count', 0)}
+
+TASK STATE:
+- Average Attention Index: {task_metrics.get('attention_index', 0):.3f}
+- Average Engagement Score: {task_metrics.get('engagement_score', 0):.3f}
+- Data points: {task_metrics.get('count', 0)}
+
+STATISTICAL ANALYSIS:
+"""
+
+        if len(rest_attention) > 5 and len(task_attention) > 5:
+            min_len = min(len(rest_attention), len(task_attention))
+            t_stat, p_value = ttest_rel(task_attention[:min_len], rest_attention[:min_len])
+            report += f"- Paired t-test (Task vs Rest): t = {t_stat:.3f}, p = {p_value:.3f}\n"
+
+            if p_value < 0.05:
+                report += "- SIGNIFICANT difference in attention between states!\n"
+            else:
+                report += "- No significant difference detected\n"
+
+        # Add recommendations
+        if task_metrics.get('attention_index', 0) > rest_metrics.get('attention_index', 0):
+            report += "\nFINDINGS:\n- Attention increased during cognitive tasks (expected)\n"
+        else:
+            report += "\nFINDINGS:\n- Attention did not increase as expected during tasks\n"
+
+        self.results_text.delete(1.0, tk.END)
+        self.results_text.insert(tk.END, report)
+
+        # Generate plots
+        self.plot_results()
+
+    def plot_results(self):
+        """Generate analysis plots"""
+        analyzer = self.controller.attention_analyzer
+
+        if not analyzer.attention_history:
+            return
+
+        # Create plots
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+
+        # Timeline plot
+        times = [(m.timestamp - analyzer.attention_history[0].timestamp) / 60
+                 for m in analyzer.attention_history]
+        attention_vals = [m.attention_index for m in analyzer.attention_history]
+        states = [m.state for m in analyzer.attention_history]
+
+        rest_times = [t for t, s in zip(times, states) if s == 'rest']
+        rest_vals = [v for v, s in zip(attention_vals, states) if s == 'rest']
+        task_times = [t for t, s in zip(times, states) if s == 'task']
+        task_vals = [v for v, s in zip(attention_vals, states) if s == 'task']
+
+        ax1.plot(rest_times, rest_vals, 'bo-', label='Rest', alpha=0.7)
+        ax1.plot(task_times, task_vals, 'ro-', label='Task', alpha=0.7)
+        ax1.set_title('Attention Index Over Time')
+        ax1.set_xlabel('Time (minutes)')
+        ax1.set_ylabel('Attention Index')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # Box plot comparison
+        if rest_vals and task_vals:
+            ax2.boxplot([rest_vals, task_vals], labels=['Rest', 'Task'])
+            ax2.set_title('Attention Index Distribution')
+            ax2.set_ylabel('Attention Index')
+
+        # Band power comparison
+        rest_metrics = analyzer.get_state_averages('rest')
+        task_metrics = analyzer.get_state_averages('task')
+
+        if rest_metrics and task_metrics:
+            bands = ['Alpha', 'Beta']
+            rest_powers = [rest_metrics.get('alpha_power', 0), rest_metrics.get('beta_power', 0)]
+            task_powers = [task_metrics.get('alpha_power', 0), task_metrics.get('beta_power', 0)]
+
+            x = np.arange(len(bands))
+            width = 0.35
+
+            ax3.bar(x - width / 2, rest_powers, width, label='Rest', alpha=0.7)
+            ax3.bar(x + width / 2, task_powers, width, label='Task', alpha=0.7)
+            ax3.set_title('EEG Band Power Comparison')
+            ax3.set_ylabel('Power (µV²)')
+            ax3.set_xticks(x)
+            ax3.set_xticklabels(bands)
+            ax3.legend()
+
+        # Performance correlation
+        if self.controller.task_responses:
+            response_times = [r['timestamp'] - analyzer.attention_history[0].timestamp
+                              for r in self.controller.task_responses]
+            accuracies = [1 if r['is_correct'] else 0 for r in self.controller.task_responses]
+
+            ax4.scatter(response_times, accuracies, alpha=0.7)
+            ax4.set_title('Task Performance Over Time')
+            ax4.set_xlabel('Time (seconds)')
+            ax4.set_ylabel('Accuracy (1=Correct, 0=Incorrect)')
+            ax4.set_ylim(-0.1, 1.1)
+
+        plt.tight_layout()
+        plt.show()
+
+    def run(self):
+        """Start the GUI main loop"""
+        self.root.mainloop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EEG Data Processing (from original code)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_command(feature_id: int, pdu_id: int, payload: bytes = b"") -> bytes:
@@ -250,7 +759,6 @@ def parse_eeg_packet(packet_data: bytes) -> Tuple[List[float], List[float]]:
 
     cmd = packet_data[0]
     data_len = packet_data[1]
-    msg_index = struct.unpack('<H', packet_data[2:4])[0]
 
     if cmd != 0x02:
         raise ValueError(f"Unexpected command: 0x{cmd:02x}")
@@ -274,644 +782,149 @@ def parse_eeg_packet(packet_data: bytes) -> Tuple[List[float], List[float]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Attention Task Generator
+# Main Experiment System (Fixed threading)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class AttentionTask:
-    """Visual Oddball paradigm for attention assessment."""
-
-    def __init__(self):
-        self.trial_sequence = []
-        self.target_trials = []
-        self.responses = []
-        self.response_times = []
-        self.hits = 0
-        self.false_alarms = 0
-        self.misses = 0
-        self.correct_rejections = 0
-
-    def generate_trial_sequence(self):
-        """Generate randomized sequence of standard and target stimuli."""
-        # Calculate number of targets and standards
-        num_targets = int(NUM_TRIALS * TARGET_PROBABILITY)
-        num_standards = NUM_TRIALS - num_targets
-
-        # Create sequence: True = target, False = standard
-        sequence = [True] * num_targets + [False] * num_standards
-        random.shuffle(sequence)
-
-        # Ensure no more than 3 consecutive targets
-        self._balance_sequence(sequence)
-
-        self.trial_sequence = sequence
-        self.target_trials = [i for i, is_target in enumerate(sequence) if is_target]
-
-        print(f"Generated {NUM_TRIALS} trials: {num_targets} targets, {num_standards} standards")
-
-    def _balance_sequence(self, sequence):
-        """Ensure no more than 3 consecutive targets."""
-        for i in range(len(sequence) - 3):
-            if all(sequence[i:i + 4]):  # 4 consecutive targets
-                # Find next standard and swap
-                for j in range(i + 4, len(sequence)):
-                    if not sequence[j]:
-                        sequence[i + 3], sequence[j] = sequence[j], sequence[i + 3]
-                        break
-
-    def get_stimulus_text(self, trial_num: int) -> str:
-        """Get stimulus text for display."""
-        if self.trial_sequence[trial_num]:
-            return "🎯 O 🎯"  # Target stimulus
-        else:
-            return "✕ X ✕"  # Standard stimulus
-
-    def is_target(self, trial_num: int) -> bool:
-        """Check if trial is a target."""
-        return self.trial_sequence[trial_num]
-
-    def record_response(self, trial_num: int, responded: bool, response_time: float):
-        """Record response for a trial."""
-        is_target = self.trial_sequence[trial_num]
-
-        if is_target and responded:
-            self.hits += 1
-        elif is_target and not responded:
-            self.misses += 1
-        elif not is_target and responded:
-            self.false_alarms += 1
-        else:
-            self.correct_rejections += 1
-
-        self.responses.append(responded)
-        self.response_times.append(response_time if responded else None)
-
-    def get_performance_stats(self) -> dict:
-        """Calculate attention performance metrics."""
-        # Calculate hit rate and false alarm rate
-        hit_rate = self.hits / (self.hits + self.misses) if (self.hits + self.misses) > 0 else 0
-        fa_rate = self.false_alarms / (self.false_alarms + self.correct_rejections) if (
-                                                                                                   self.false_alarms + self.correct_rejections) > 0 else 0
-
-        # Calculate d-prime (sensitivity) and criterion
-        # Avoid extreme values
-        hit_rate = max(0.01, min(0.99, hit_rate))
-        fa_rate = max(0.01, min(0.99, fa_rate))
-
-        from scipy.stats import norm
-        d_prime = norm.ppf(hit_rate) - norm.ppf(fa_rate)
-        criterion = -0.5 * (norm.ppf(hit_rate) + norm.ppf(fa_rate))
-
-        # Calculate reaction time for hits
-        hit_rts = [rt for i, rt in enumerate(self.response_times)
-                   if rt is not None and self.trial_sequence[i]]
-        avg_rt = np.mean(hit_rts) if hit_rts else 0
-
-        return {
-            'hits': self.hits,
-            'misses': self.misses,
-            'false_alarms': self.false_alarms,
-            'correct_rejections': self.correct_rejections,
-            'hit_rate': hit_rate,
-            'false_alarm_rate': fa_rate,
-            'd_prime': d_prime,
-            'criterion': criterion,
-            'avg_reaction_time': avg_rt,
-            'accuracy': (self.hits + self.correct_rejections) / NUM_TRIALS
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Data Collector for Attention
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class AttentionDataCollector:
-    """Data collector for attention assessment."""
-
-    def __init__(self):
-        self.ch1_data = []
-        self.ch2_data = []
-        self.recording = False
-        self.start_time = None
-        self.current_phase = ""
-
-    def start_recording(self, phase: str):
-        """Start recording for a specific phase."""
-        self.ch1_data = []
-        self.ch2_data = []
-        self.recording = True
-        self.start_time = time.time()
-        self.current_phase = phase
-
-    def stop_recording(self):
-        """Stop recording."""
-        self.recording = False
-
-    def add_data(self, ch1_samples: List[float], ch2_samples: List[float]):
-        """Add new data samples."""
-        if self.recording:
-            self.ch1_data.extend(ch1_samples)
-            self.ch2_data.extend(ch2_samples)
-
-    def get_recording_time(self) -> float:
-        """Get current recording time in seconds."""
-        if self.start_time is None:
-            return 0
-        return time.time() - self.start_time
-
-    def get_data(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Get recorded data as numpy arrays."""
-        return np.array(self.ch1_data), np.array(self.ch2_data)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Enhanced Signal Processing Functions
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def process_attention_data_improved(ch1_data: np.ndarray, ch2_data: np.ndarray) -> dict:
-    """Enhanced attention data processing with artifact rejection."""
-    processor = ImprovedEEGProcessor(250)
-
-    # Validate input data
-    if len(ch1_data) < 500 or len(ch2_data) < 500:  # Need at least 2 seconds
-        print("Warning: Insufficient data for reliable analysis")
-        return {}
-
-    print(f"Processing {len(ch1_data)} samples ({len(ch1_data) / 250:.1f} seconds)")
-
-    # Preprocess signals
-    print("Applying artifact rejection and filtering...")
-    ch1_clean = processor.preprocess_signal(ch1_data)
-    ch2_clean = processor.preprocess_signal(ch2_data)
-
-    # Validate data quality
-    ch1_quality = processor.validate_data_quality(ch1_clean)
-    ch2_quality = processor.validate_data_quality(ch2_clean)
-
-    print(f"Channel 1 quality: {ch1_quality['quality']} - {ch1_quality.get('reasons', [])}")
-    print(f"Channel 2 quality: {ch2_quality['quality']} - {ch2_quality.get('reasons', [])}")
-
-    # Calculate frequency band powers
-    freq_bands = {
-        'theta': (4, 8),
-        'alpha': (8, 12),
-        'beta': (13, 30)
-    }
-
-    results = {
-        'ch1_quality': ch1_quality,
-        'ch2_quality': ch2_quality,
-        'data_length': len(ch1_data) / 250  # in seconds
-    }
-
-    for band_name, freq_range in freq_bands.items():
-        ch1_power = processor.calculate_band_power_robust(ch1_clean, freq_range)
-        ch2_power = processor.calculate_band_power_robust(ch2_clean, freq_range)
-
-        results[f'ch1_{band_name}'] = ch1_power
-        results[f'ch2_{band_name}'] = ch2_power
-
-        print(
-            f"{band_name.capitalize()} ({freq_range[0]}-{freq_range[1]} Hz): CH1={ch1_power:.3f}, CH2={ch2_power:.3f}")
-
-    return results
-
-
-def calculate_attention_indices(rest_data: dict, task_data: dict) -> dict:
-    """Calculate attention indices with validation."""
-    indices = {}
-    warnings = []
-
-    bands = ['theta', 'alpha', 'beta']
-    channels = ['ch1', 'ch2']
-
-    for band in bands:
-        for ch in channels:
-            rest_key = f'{ch}_{band}'
-
-            if rest_key not in rest_data or rest_key not in task_data:
-                continue
-
-            rest_power = rest_data[rest_key]
-            task_power = task_data[rest_key]
-
-            # Validate powers
-            if rest_power <= 0 or task_power <= 0:
-                warnings.append(f"{ch} {band}: Invalid power values")
-                continue
-
-            ratio = task_power / rest_power
-
-            # Check for unrealistic ratios
-            if ratio > 10:
-                warnings.append(f"{ch} {band}: Very high ratio ({ratio:.1f}) - possible artifacts")
-            elif ratio < 0.1:
-                warnings.append(f"{ch} {band}: Very low ratio ({ratio:.1f}) - possible artifacts")
-
-            indices[f'{ch}_{band}_ratio'] = ratio
-
-    if warnings:
-        print("Data quality warnings:")
-        for warning in warnings:
-            print(f"  - {warning}")
-
-    return indices
-
-
-def plot_attention_analysis_improved(rest_results, task_results, indices):
-    """Create improved attention analysis plots with data quality indicators."""
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-
-    bands = ['Theta\n(4-8 Hz)', 'Alpha\n(8-12 Hz)', 'Beta\n(13-30 Hz)']
-    band_keys = ['theta', 'alpha', 'beta']
-
-    # Function to get values safely
-    def get_values(channel, results):
-        return [results.get(f'{channel}_{band}', 0) for band in band_keys]
-
-    # Channel 1 power comparison
-    ch1_rest = get_values('ch1', rest_results)
-    ch1_task = get_values('ch1', task_results)
-
-    x = np.arange(len(bands))
-    width = 0.35
-
-    bars1 = ax1.bar(x - width / 2, ch1_rest, width, label='Rest', color='lightblue', alpha=0.7)
-    bars2 = ax1.bar(x + width / 2, ch1_task, width, label='Attention Task', color='orange', alpha=0.7)
-
-    ax1.set_title('Channel 1 - Frequency Band Power', fontweight='bold')
-    ax1.set_ylabel('Power (µV²)')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(bands)
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    ax1.set_yscale('log')  # Log scale for better visualization
-
-    # Add quality indicator
-    quality1 = rest_results.get('ch1_quality', {}).get('quality', 'unknown')
-    ax1.text(0.02, 0.98, f'Data Quality: {quality1}', transform=ax1.transAxes,
-             verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-
-    # Channel 2 power comparison
-    ch2_rest = get_values('ch2', rest_results)
-    ch2_task = get_values('ch2', task_results)
-
-    bars3 = ax2.bar(x - width / 2, ch2_rest, width, label='Rest', color='lightblue', alpha=0.7)
-    bars4 = ax2.bar(x + width / 2, ch2_task, width, label='Attention Task', color='orange', alpha=0.7)
-
-    ax2.set_title('Channel 2 - Frequency Band Power', fontweight='bold')
-    ax2.set_ylabel('Power (µV²)')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(bands)
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    ax2.set_yscale('log')  # Log scale for better visualization
-
-    # Add quality indicator
-    quality2 = rest_results.get('ch2_quality', {}).get('quality', 'unknown')
-    ax2.text(0.02, 0.98, f'Data Quality: {quality2}', transform=ax2.transAxes,
-             verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-
-    # Channel 1 ratios
-    ch1_ratios = [indices.get(f'ch1_{band}_ratio', 1) for band in band_keys]
-    colors1 = []
-    for i, ratio in enumerate(ch1_ratios):
-        if band_keys[i] == 'alpha':
-            colors1.append('green' if ratio < 1 else 'red')  # Alpha should decrease
-        else:
-            colors1.append('green' if ratio > 1 else 'red')  # Theta/Beta should increase
-
-    bars5 = ax3.bar(bands, ch1_ratios, color=colors1, alpha=0.7, edgecolor='black')
-    ax3.axhline(y=1, color='black', linestyle='--', alpha=0.5, label='Baseline')
-    ax3.set_title('Channel 1 - Attention Indices (Task/Rest)', fontweight='bold')
-    ax3.set_ylabel('Ratio')
-    ax3.set_ylim(0, min(5, max(ch1_ratios) * 1.1))  # Cap at reasonable values
-    ax3.grid(True, alpha=0.3)
-
-    for bar, ratio in zip(bars5, ch1_ratios):
-        height = bar.get_height()
-        ax3.text(bar.get_x() + bar.get_width() / 2., height + 0.02,
-                 f'{ratio:.2f}', ha='center', va='bottom', fontweight='bold')
-
-    # Channel 2 ratios
-    ch2_ratios = [indices.get(f'ch2_{band}_ratio', 1) for band in band_keys]
-    colors2 = []
-    for i, ratio in enumerate(ch2_ratios):
-        if band_keys[i] == 'alpha':
-            colors2.append('green' if ratio < 1 else 'red')  # Alpha should decrease
-        else:
-            colors2.append('green' if ratio > 1 else 'red')  # Theta/Beta should increase
-
-    bars6 = ax4.bar(bands, ch2_ratios, color=colors2, alpha=0.7, edgecolor='black')
-    ax4.axhline(y=1, color='black', linestyle='--', alpha=0.5, label='Baseline')
-    ax4.set_title('Channel 2 - Attention Indices (Task/Rest)', fontweight='bold')
-    ax4.set_ylabel('Ratio')
-    ax4.set_ylim(0, min(5, max(ch2_ratios) * 1.1))  # Cap at reasonable values
-    ax4.grid(True, alpha=0.3)
-
-    for bar, ratio in zip(bars6, ch2_ratios):
-        height = bar.get_height()
-        ax4.text(bar.get_x() + bar.get_width() / 2., height + 0.02,
-                 f'{ratio:.2f}', ha='center', va='bottom', fontweight='bold')
-
-    plt.tight_layout()
-    plt.suptitle('Enhanced Attention Assessment with Artifact Rejection',
-                 fontsize=16, fontweight='bold', y=1.02)
-
-    # Add interpretation guide
-    fig.text(0.5, 0.01,
-             'Expected: ↑Theta (attention), ↓Alpha (alertness), ↑Beta (focus). Green=Good, Red=Poor/Artifacts',
-             ha='center', fontsize=10, style='italic')
-
-    plt.show()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Enhanced Attention Experiment
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class AttentionExperiment:
-    def __init__(self):
-        self.collector = AttentionDataCollector()
-        self.task = AttentionTask()
-        self.rest_data = None
-        self.attention_data = None
+class AttentionMeasurementSystem:
+    """Main system integrating EEG streaming with attention analysis"""
+
+    def __init__(self, openai_api_key: str):
+        # Initialize components
+        self.ai_generator = AITaskGenerator(openai_api_key)
+        self.attention_analyzer = AttentionAnalyzer()
+        self.experiment_controller = ExperimentController(self.ai_generator, self.attention_analyzer)
+
+        # GUI setup (will run in main thread)
+        self.gui = AttentionExperimentGUI(self.experiment_controller)
+
+        # EEG streaming
+        self.eeg_client = None
+        self.streaming = False
+        self.eeg_thread = None
 
     def notification_handler(self, sender: int, data: bytearray):
-        """Handle incoming EEG data."""
+        """Handle incoming EEG data"""
         try:
             if len(data) < 6:
                 return
+
             ch1_samples, ch2_samples = parse_eeg_packet(data[2:])
-            self.collector.add_data(ch1_samples, ch2_samples)
+
+            # Add to attention analyzer
+            self.attention_analyzer.add_data(np.array(ch1_samples), np.array(ch2_samples))
+
+            # Calculate current metrics if in experiment
+            if self.experiment_controller.experiment_running:
+                metrics = self.attention_analyzer.calculate_attention_metrics(
+                    self.experiment_controller.current_state)
+
+                if metrics:
+                    # Send metrics to GUI via queue
+                    self.experiment_controller.gui_queue.put(('metrics_update', metrics))
+
         except Exception as e:
-            print(f"Data parsing error: {e}")
+            print(f"EEG data processing error: {e}")
 
-    async def run_experiment(self, device_address: str):
-        """Run the complete attention experiment."""
-        print(f"Connecting to {device_address}...")
+    async def start_eeg_streaming(self, device_address: str):
+        """Start EEG data streaming"""
+        print(f"Connecting to EEG device: {device_address}")
 
-        async with BleakClient(device_address, timeout=20.0) as client:
-            if not client.is_connected:
-                raise RuntimeError("Failed to connect to device")
+        self.eeg_client = BleakClient(device_address, timeout=20.0)
+        await self.eeg_client.connect()
 
-            print("Connected! Setting up data stream...")
+        if not self.eeg_client.is_connected:
+            raise RuntimeError("Failed to connect to EEG device")
 
-            # Start notifications
-            await client.start_notify(TX_UUID, self.notification_handler)
+        print("EEG device connected! Setting up data stream...")
 
-            # Start streaming
-            start_cmd = build_stream_command(True)
-            await client.write_gatt_char(RX_UUID, start_cmd, response=False)
+        try:
+            await self.eeg_client.request_mtu(247)
+        except:
+            pass
 
-            try:
-                # Generate task sequence
-                self.task.generate_trial_sequence()
+        await self.eeg_client.start_notify(TX_UUID, self.notification_handler)
 
-                # Phase 1: Baseline rest
-                await self.baseline_rest()
+        start_cmd = build_stream_command(True)
+        await self.eeg_client.write_gatt_char(RX_UUID, start_cmd, response=False)
 
-                # Phase 2: Attention task
-                await self.attention_task()
+        self.streaming = True
+        print("EEG streaming started!")
 
-                # Phase 3: Recovery rest
-                await self.recovery_rest()
+        # Update experiment while streaming
+        try:
+            while self.streaming and self.eeg_client.is_connected:
+                self.experiment_controller.update()
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            print(f"EEG streaming error: {e}")
+        finally:
+            if self.eeg_client and self.eeg_client.is_connected:
+                try:
+                    stop_cmd = build_stream_command(False)
+                    await self.eeg_client.write_gatt_char(RX_UUID, stop_cmd, response=False)
+                    await self.eeg_client.stop_notify(TX_UUID)
+                    await self.eeg_client.disconnect()
+                except:
+                    pass
 
-                # Analyze results
-                self.analyze_attention()
+    def stop_eeg_streaming(self):
+        """Stop EEG streaming"""
+        self.streaming = False
 
-            finally:
-                # Stop streaming
-                stop_cmd = build_stream_command(False)
-                await client.write_gatt_char(RX_UUID, stop_cmd, response=False)
-                await client.stop_notify(TX_UUID)
+    def run_eeg_thread(self):
+        """Run EEG streaming in separate thread"""
+        try:
+            # Find and connect to device
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-    async def baseline_rest(self):
-        """Record baseline rest period."""
-        print(f"\n{'=' * 70}")
-        print("PHASE 1: BASELINE REST")
-        print(f"{'=' * 70}")
-        print("Please sit comfortably and relax with eyes open.")
-        print("Look at a fixed point and try to minimize eye movements.")
-        print(f"Recording will start in 5 seconds for {REST_TIME_SEC} seconds...")
+            device_address = loop.run_until_complete(find_device())
+            loop.run_until_complete(self.start_eeg_streaming(device_address))
 
-        for i in range(5, 0, -1):
-            print(f"{i}...")
-            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"EEG thread error: {e}")
+        finally:
+            print("EEG thread stopped")
 
-        print(f"\n🔴 RECORDING BASELINE - Please stay relaxed and alert")
-        print("=" * 70)
+    def run(self):
+        """Run the complete system with proper threading"""
+        # Start EEG streaming in background thread
+        self.eeg_thread = threading.Thread(target=self.run_eeg_thread, daemon=True)
+        self.eeg_thread.start()
 
-        self.collector.start_recording("BASELINE")
-
-        start_time = time.time()
-        while time.time() - start_time < REST_TIME_SEC:
-            remaining = REST_TIME_SEC - (time.time() - start_time)
-            print(f"\rBaseline recording: {remaining:.1f}s remaining", end="", flush=True)
-            await asyncio.sleep(0.1)
-
-        self.collector.stop_recording()
-        baseline_data = self.collector.get_data()
-        self.rest_data = baseline_data
-
-        print(f"\n✅ Baseline recording complete! Collected {len(baseline_data[0])} samples")
-
-    async def attention_task(self):
-        """Run visual oddball attention task."""
-        print(f"\n{'=' * 70}")
-        print("PHASE 2: VISUAL ODDBALL ATTENTION TASK")
-        print(f"{'=' * 70}")
-        print("You will see X's and O's on the screen.")
-        print("INSTRUCTIONS:")
-        print("• Press SPACE when you see the TARGET: 🎯 O 🎯")
-        print("• DO NOT press anything for STANDARD: ✕ X ✕")
-        print("• Respond as quickly and accurately as possible")
-        print("• Keep your eyes focused on the center")
-        print(f"\nTotal trials: {NUM_TRIALS}")
-        print(f"Target probability: {TARGET_PROBABILITY * 100:.0f}%")
-        print("\nStarting in 5 seconds...")
-
-        for i in range(5, 0, -1):
-            print(f"{i}...")
-            await asyncio.sleep(1)
-
-        print(f"\n🔴 STARTING ATTENTION TASK")
-        print("=" * 70)
-
-        self.collector.start_recording("ATTENTION")
-
-        # Run oddball trials
-        for trial in range(NUM_TRIALS):
-            stimulus = self.task.get_stimulus_text(trial)
-            is_target = self.task.is_target(trial)
-
-            # Display stimulus
-            print(f"\nTrial {trial + 1}/{NUM_TRIALS}")
-            print(f"\n      {stimulus}")
-            print(f"      {'TARGET!' if is_target else 'Standard'}")
-
-            # Record response (in real implementation, use keyboard input)
-            start_time = time.time()
-            await asyncio.sleep(STIMULUS_DURATION)
-
-            # Simulate response based on target detection (for demo)
-            if is_target:
-                # Simulate 85% hit rate with some reaction time
-                responded = random.random() < 0.85
-                rt = random.uniform(0.3, 0.8) if responded else 0
-            else:
-                # Simulate 10% false alarm rate
-                responded = random.random() < 0.10
-                rt = random.uniform(0.4, 1.0) if responded else 0
-
-            self.task.record_response(trial, responded, rt)
-
-            if responded:
-                print(f"      Response: SPACE (RT: {rt:.2f}s)")
-            else:
-                print(f"      Response: None")
-
-            # Inter-stimulus interval
-            isi = random.uniform(*ISI_RANGE)
-            await asyncio.sleep(isi)
-
-            # Progress update
-            if (trial + 1) % 20 == 0:
-                progress = (trial + 1) / NUM_TRIALS * 100
-                print(f"\n--- Progress: {progress:.0f}% complete ---")
-
-        self.collector.stop_recording()
-        attention_data = self.collector.get_data()
-        self.attention_data = attention_data
-
-        print(f"\n✅ Attention task complete! Collected {len(attention_data[0])} samples")
-
-        # Show performance stats
-        stats = self.task.get_performance_stats()
-        print(f"\nPERFORMANCE STATISTICS:")
-        print(f"Accuracy: {stats['accuracy']:.1%}")
-        print(f"Hit Rate: {stats['hit_rate']:.1%}")
-        print(f"False Alarm Rate: {stats['false_alarm_rate']:.1%}")
-        print(f"d' (Sensitivity): {stats['d_prime']:.2f}")
-        print(f"Average Reaction Time: {stats['avg_reaction_time']:.2f}s")
-
-    async def recovery_rest(self):
-        """Record recovery rest period."""
-        print(f"\n{'=' * 70}")
-        print("PHASE 3: RECOVERY REST")
-        print(f"{'=' * 70}")
-        print("Task complete! Please relax again.")
-        print(f"Final recording for {REST_TIME_SEC} seconds...")
-
-        for i in range(5, 0, -1):
-            print(f"{i}...")
-            await asyncio.sleep(1)
-
-        print(f"\n🔴 RECORDING RECOVERY - Please relax")
-        print("=" * 70)
-
-        self.collector.start_recording("RECOVERY")
-
-        start_time = time.time()
-        while time.time() - start_time < REST_TIME_SEC:
-            remaining = REST_TIME_SEC - (time.time() - start_time)
-            print(f"\rRecovery recording: {remaining:.1f}s remaining", end="", flush=True)
-            await asyncio.sleep(0.1)
-
-        self.collector.stop_recording()
-        print(f"\n✅ Recovery recording complete!")
-
-    def analyze_attention(self):
-        """Enhanced attention analysis with better data handling."""
-        if self.rest_data is None or self.attention_data is None:
-            print("Error: Missing data for analysis")
-            return
-
-        print(f"\n{'=' * 70}")
-        print("ENHANCED ATTENTION ANALYSIS")
-        print(f"{'=' * 70}")
-
-        # Process data with improved methods
-        print("\nProcessing REST data:")
-        rest_results = process_attention_data_improved(*self.rest_data)
-
-        print("\nProcessing ATTENTION TASK data:")
-        task_results = process_attention_data_improved(*self.attention_data)
-
-        if not rest_results or not task_results:
-            print("Error: Could not process data")
-            return
-
-        # Calculate indices with validation
-        print("\nCalculating attention indices...")
-        indices = calculate_attention_indices(rest_results, task_results)
-
-        # Display results
-        print(f"\n{'=' * 50}")
-        print("IMPROVED ATTENTION RESULTS:")
-        print(f"{'=' * 50}")
-
-        bands = ['theta', 'alpha', 'beta']
-        band_ranges = ['(4-8 Hz)', '(8-12 Hz)', '(13-30 Hz)']
-
-        for i, (band, range_str) in enumerate(zip(bands, band_ranges)):
-            print(f"\n{band.upper()} {range_str}:")
-
-            for ch in ['ch1', 'ch2']:
-                rest_key = f'{ch}_{band}'
-                ratio_key = f'{ch}_{band}_ratio'
-
-                if rest_key in rest_results and rest_key in task_results:
-                    rest_val = rest_results[rest_key]
-                    task_val = task_results[rest_key]
-                    ratio_val = indices.get(ratio_key, 0)
-
-                    print(f"  {ch.upper()}: Rest={rest_val:.3f}, Task={task_val:.3f}, Ratio={ratio_val:.2f}")
-
-                    # Interpretation
-                    if band == 'theta' and ratio_val > 1.2:
-                        print(f"    ✓ Good attention/working memory engagement")
-                    elif band == 'alpha' and ratio_val < 0.8:
-                        print(f"    ✓ Good alertness (alpha suppression)")
-                    elif band == 'beta' and ratio_val > 1.1:
-                        print(f"    ✓ Good focused attention")
-                    else:
-                        print(f"    ? Ratio within normal range or possible artifacts")
-
-        # Create improved visualization
-        if indices:
-            plot_attention_analysis_improved(rest_results, task_results, indices)
-        else:
-            print("Could not create plots due to data quality issues")
+        # Run GUI in main thread
+        try:
+            self.gui.run()
+        except KeyboardInterrupt:
+            print("Shutting down...")
+        finally:
+            self.stop_eeg_streaming()
+            print("System shutdown complete.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main Application
+# Main Application Entry Point
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def main():
-    print("Neocore EEG Enhanced Attention Assessment")
-    print("Visual Oddball Paradigm with Artifact Rejection")
-    print("=" * 70)
-    print(f"Number of trials: {NUM_TRIALS}")
-    print(f"Target probability: {TARGET_PROBABILITY * 100:.0f}%")
-    print(f"Rest periods: {REST_TIME_SEC} seconds each")
-    print("Frequency bands: Theta (4-8), Alpha (8-12), Beta (13-30) Hz")
-    print("Enhanced with artifact rejection and data quality validation")
-    print("=" * 70)
+def main():
+    print("EEG Attention Measurement System")
+    print("=" * 50)
 
-    target_mac = None
-    if len(sys.argv) > 1:
-        for arg in sys.argv[1:]:
-            if ':' in arg:
-                target_mac = arg.upper()
-                break
+    # Get OpenAI API key
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    if not openai_api_key:
+        openai_api_key = input("Enter your OpenAI API key: ").strip()
+        if not openai_api_key:
+            print("OpenAI API key required for task generation!")
+            return 1
 
     try:
-        device_address = await find_device(target_mac)
-        experiment = AttentionExperiment()
-        await experiment.run_experiment(device_address)
+        # Initialize and run system
+        system = AttentionMeasurementSystem(openai_api_key)
+        system.run()
+
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"System error: {e}")
         return 1
 
     return 0
@@ -919,8 +932,8 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        exit_code = asyncio.run(main())
+        exit_code = main()
         sys.exit(exit_code)
     except KeyboardInterrupt:
-        print("\nExperiment interrupted!")
+        print("\nSystem stopped by user.")
         sys.exit(0)
